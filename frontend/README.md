@@ -8,7 +8,7 @@ mock (`src/lib/mock.ts`) so you don't need a router on the bench.
 
 ```sh
 pnpm install
-pnpm fonts          # downloads CaskaydiaMono Nerd Font (.ttf) into ./public/fonts
+pnpm fonts          # downloads CaskaydiaCove Nerd Font Mono (.ttf) into ./public/fonts
 pnpm dev            # http://localhost:5173
 ```
 
@@ -22,11 +22,11 @@ non-empty password — the real YubiKey flow lands in M2.
 | `pnpm dev`    | start Vite dev server with the mocked RPC transport         |
 | `pnpm build`  | production build into `./dist`                              |
 | `pnpm check`  | run `svelte-check` (types + a11y)                           |
-| `pnpm fonts`  | fetch CaskaydiaMono Nerd Font into `./public/fonts/`        |
+| `pnpm fonts`  | fetch CaskaydiaCove Nerd Font Mono into `./public/fonts/`   |
 
 ## Fonts
 
-We use **CaskaydiaMono Nerd Font** for both UI text and icons. The font
+We use **CaskaydiaCove Nerd Font Mono** for both UI text and icons. The font
 binaries are not committed (see root `.gitignore`); run `pnpm fonts` to
 fetch them. The script downloads from the
 [ryanoasis/nerd-fonts](https://github.com/ryanoasis/nerd-fonts/releases)

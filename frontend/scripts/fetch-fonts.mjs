@@ -17,15 +17,16 @@ const root = join(here, '..');
 const out = join(root, 'public', 'fonts');
 const tmp = join(root, '.font-tmp');
 
-const VERSION = 'v3.2.1';
+const VERSION = 'v3.4.0';
 const ASSET = 'CascadiaCode.zip';
 const URL = `https://github.com/ryanoasis/nerd-fonts/releases/download/${VERSION}/${ASSET}`;
 
-// What we want -> what's in the zip (mono, no ligatures variant).
+// disk name (under public/fonts) -> source name in the upstream zip.
+// We use the Mono variant (fixed-width, no ligatures dropping cells).
 const WANT = {
-  'CaskaydiaMonoNerdFont-Regular.ttf':  'CaskaydiaMonoNerdFont-Regular.ttf',
-  'CaskaydiaMonoNerdFont-SemiBold.ttf': 'CaskaydiaMonoNerdFont-SemiBold.ttf',
-  'CaskaydiaMonoNerdFont-Italic.ttf':   'CaskaydiaMonoNerdFont-Italic.ttf',
+  'CaskaydiaCoveMono-Regular.ttf':  'CaskaydiaCoveNerdFontMono-Regular.ttf',
+  'CaskaydiaCoveMono-SemiBold.ttf': 'CaskaydiaCoveNerdFontMono-SemiBold.ttf',
+  'CaskaydiaCoveMono-Italic.ttf':   'CaskaydiaCoveNerdFontMono-Italic.ttf',
 };
 
 mkdirSync(out, { recursive: true });

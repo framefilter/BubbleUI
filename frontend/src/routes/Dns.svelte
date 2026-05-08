@@ -1,7 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { rpc } from '../lib/rpc';
-  import { ICON } from '../lib/icons';
 
   interface DnsStatus { provider: string; mode: 'doh' | 'dot'; enforced: boolean }
 

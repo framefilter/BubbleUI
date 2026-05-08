@@ -176,7 +176,7 @@ A simple, security-conscious web UI for OpenWRT travel routers.
 
 We're using a **Nerd Font** as both UI and icon font. This avoids shipping an icon set (Lucide/Feather are ~30-50 KB even tree-shaken) — instead we render glyphs like `` (wifi) directly.
 
-**Default: CaskaydiaMono Nerd Font** (Cascadia Code patched, mono variant).
+**Default: CaskaydiaCove Nerd Font Mono** (Cascadia Code patched, mono variant — colloquially "CaskaydiaMono").
 
 - Same font Omarchy shipped as its default until v3.2.0 — friendly, readable, distinctive curly italics. Reads as "fun" rather than "enterprise."
 - Cascadia Code is Microsoft-maintained; the Nerd Font patch tracks upstream releases.

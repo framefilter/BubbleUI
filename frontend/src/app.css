@@ -1,43 +1,44 @@
 /*
  * BubbleUI — base stylesheet.
  *
- * Font: CaskaydiaMono Nerd Font, the same family Omarchy shipped as its
- * default until v3.2.0. We use it for both UI text and icons (Nerd Font
- * private-use glyphs replace a separate icon library).
+ * Font: CaskaydiaCove Nerd Font Mono — the upstream name for the Cascadia
+ * Code patch that Omarchy shipped as its default until v3.2.0. We use it
+ * for both UI text and icons (Nerd Font private-use glyphs replace a
+ * separate icon library).
  *
  * Font binaries are not committed to the repo. Run `pnpm fonts` to fetch
- * and subset them into ./public/fonts/. See frontend/README.md.
+ * them into ./public/fonts/. See frontend/README.md.
  */
 
 @font-face {
-  font-family: 'CaskaydiaMono Nerd Font';
-  src: url('/fonts/CaskaydiaMonoNerdFont-Regular.woff2') format('woff2'),
-       url('/fonts/CaskaydiaMonoNerdFont-Regular.ttf')   format('truetype');
+  font-family: 'CaskaydiaCove Nerd Font Mono';
+  src: url('/fonts/CaskaydiaCoveMono-Regular.woff2') format('woff2'),
+       url('/fonts/CaskaydiaCoveMono-Regular.ttf')   format('truetype');
   font-weight: 400;
   font-style: normal;
   font-display: swap;
 }
 
 @font-face {
-  font-family: 'CaskaydiaMono Nerd Font';
-  src: url('/fonts/CaskaydiaMonoNerdFont-SemiBold.woff2') format('woff2'),
-       url('/fonts/CaskaydiaMonoNerdFont-SemiBold.ttf')   format('truetype');
+  font-family: 'CaskaydiaCove Nerd Font Mono';
+  src: url('/fonts/CaskaydiaCoveMono-SemiBold.woff2') format('woff2'),
+       url('/fonts/CaskaydiaCoveMono-SemiBold.ttf')   format('truetype');
   font-weight: 600;
   font-style: normal;
   font-display: swap;
 }
 
 @font-face {
-  font-family: 'CaskaydiaMono Nerd Font';
-  src: url('/fonts/CaskaydiaMonoNerdFont-Italic.woff2') format('woff2'),
-       url('/fonts/CaskaydiaMonoNerdFont-Italic.ttf')   format('truetype');
+  font-family: 'CaskaydiaCove Nerd Font Mono';
+  src: url('/fonts/CaskaydiaCoveMono-Italic.woff2') format('woff2'),
+       url('/fonts/CaskaydiaCoveMono-Italic.ttf')   format('truetype');
   font-weight: 400;
   font-style: italic;
   font-display: swap;
 }
 
 :root {
-  --font-mono: 'CaskaydiaMono Nerd Font', 'JetBrainsMono Nerd Font',
+  --font-mono: 'CaskaydiaCove Nerd Font Mono', 'JetBrainsMono Nerd Font',
                'Maple Mono NF', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
 
   --bg:        #0e1116;
