@@ -1,0 +1,141 @@
+/*
+ * BubbleUI — base stylesheet.
+ *
+ * Font: CaskaydiaMono Nerd Font, the same family Omarchy shipped as its
+ * default until v3.2.0. We use it for both UI text and icons (Nerd Font
+ * private-use glyphs replace a separate icon library).
+ *
+ * Font binaries are not committed to the repo. Run `pnpm fonts` to fetch
+ * and subset them into ./public/fonts/. See frontend/README.md.
+ */
+
+@font-face {
+  font-family: 'CaskaydiaMono Nerd Font';
+  src: url('/fonts/CaskaydiaMonoNerdFont-Regular.woff2') format('woff2'),
+       url('/fonts/CaskaydiaMonoNerdFont-Regular.ttf')   format('truetype');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'CaskaydiaMono Nerd Font';
+  src: url('/fonts/CaskaydiaMonoNerdFont-SemiBold.woff2') format('woff2'),
+       url('/fonts/CaskaydiaMonoNerdFont-SemiBold.ttf')   format('truetype');
+  font-weight: 600;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'CaskaydiaMono Nerd Font';
+  src: url('/fonts/CaskaydiaMonoNerdFont-Italic.woff2') format('woff2'),
+       url('/fonts/CaskaydiaMonoNerdFont-Italic.ttf')   format('truetype');
+  font-weight: 400;
+  font-style: italic;
+  font-display: swap;
+}
+
+:root {
+  --font-mono: 'CaskaydiaMono Nerd Font', 'JetBrainsMono Nerd Font',
+               'Maple Mono NF', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+
+  --bg:        #0e1116;
+  --bg-elev:   #161b22;
+  --bg-input:  #0b0e13;
+  --border:    #2a313c;
+  --fg:        #e6edf3;
+  --fg-dim:    #8b949e;
+  --fg-faint:  #6e7681;
+
+  --accent-ok:    #3fb950;  /* secured / connected */
+  --accent-warn:  #d29922;  /* needs attention */
+  --accent-err:   #f85149;  /* failure only */
+
+  --radius: 6px;
+  --space:  8px;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg:       #fafafa;
+    --bg-elev:  #ffffff;
+    --bg-input: #ffffff;
+    --border:   #d0d7de;
+    --fg:       #1f2328;
+    --fg-dim:   #59636e;
+    --fg-faint: #818b98;
+  }
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font-mono);
+  font-size: 14px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+#app { min-height: 100%; }
+
+a { color: var(--accent-ok); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+button, input, select, textarea {
+  font: inherit;
+  color: inherit;
+}
+
+button {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: calc(var(--space) * 0.75) calc(var(--space) * 1.5);
+  cursor: pointer;
+}
+button:hover  { border-color: var(--fg-dim); }
+button:active { transform: translateY(1px); }
+button[disabled] { opacity: 0.5; cursor: not-allowed; }
+
+input, select, textarea {
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: calc(var(--space) * 0.75) var(--space);
+  width: 100%;
+}
+input:focus, select:focus, textarea:focus {
+  outline: none;
+  border-color: var(--accent-ok);
+}
+
+.icon {
+  display: inline-block;
+  width: 1em;
+  text-align: center;
+  font-style: normal;
+}
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  font-size: 12px;
+}
+.pill.ok    { color: var(--accent-ok);   border-color: var(--accent-ok); }
+.pill.warn  { color: var(--accent-warn); border-color: var(--accent-warn); }
+.pill.err   { color: var(--accent-err);  border-color: var(--accent-err); }
+
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; animation: none !important; }
+}

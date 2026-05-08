@@ -176,14 +176,14 @@ A simple, security-conscious web UI for OpenWRT travel routers.
 
 We're using a **Nerd Font** as both UI and icon font. This avoids shipping an icon set (Lucide/Feather are ~30-50 KB even tree-shaken) — instead we render glyphs like `` (wifi) directly.
 
-**Default: Monaspace Neon (Nerd Font Mono)** — `MonaspiceNe`.
+**Default: CaskaydiaMono Nerd Font** (Cascadia Code patched, mono variant).
 
-- GitHub-maintained, actively developed.
-- Texture-healing for clean rendering at small sizes.
-- Five complementary variants (Neon, Argon, Xenon, Radon, Krypton) we can use for hierarchy without changing weight.
-- Subsetted to Latin + Nerd Font private-use glyphs we actually reference, shipped as WOFF2. Target font payload < 60 KB.
+- Same font Omarchy shipped as its default until v3.2.0 — friendly, readable, distinctive curly italics. Reads as "fun" rather than "enterprise."
+- Cascadia Code is Microsoft-maintained; the Nerd Font patch tracks upstream releases.
+- Subsetted to Latin + the icon glyphs we actually reference, shipped as WOFF2. Target font payload < 60 KB.
+- Ghostty rendering issues (the reason Omarchy moved away from it) don't apply to us — we render in a browser, not a terminal emulator.
 
-**Alternates documented** for the user to swap via a CSS variable: Maple Mono NF, JetBrainsMono Nerd Font, CommitMono Nerd Font, CaskaydiaCove Nerd Font.
+**Alternates documented** for the user to swap via a CSS variable: JetBrainsMono Nerd Font, Maple Mono NF, Monaspace Neon (`MonaspiceNe`), CommitMono Nerd Font.
 
 Body text uses the same monospace at 14 px / 1.55 line-height. Going monospace-only is a design choice — it reads as a serious sysadmin tool, not a consumer gadget, which matches the security-conscious posture.
 

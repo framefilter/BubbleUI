@@ -1,0 +1,39 @@
+# Editors / OS
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+!.vscode/extensions.json
+
+# Node
+node_modules/
+.pnpm-store/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Build output
+dist/
+build/
+*.tsbuildinfo
+.svelte-kit/
+
+# Vite
+.vite/
+
+# Env / secrets
+.env
+.env.local
+.env.*.local
+
+# Misc
+*.log
+coverage/
+
+# Font binaries — fetched by `pnpm fonts` into frontend/public/fonts.
+# We intentionally don't commit the upstream Nerd Font releases.
+frontend/public/fonts/*.woff2
+frontend/public/fonts/*.ttf
