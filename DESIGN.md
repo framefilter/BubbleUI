@@ -251,10 +251,10 @@ Anything else is denied. ACL files are versioned in this repo.
 2. **Setup-mode network.** Do we use the standard OpenWRT recovery `192.168.1.1`, or a less-collision-prone `192.168.111.1`?
 3. **Firmware update flow.** Out of scope for v0, but we should not regress sysupgrade.
 4. **Telemetry.** Default: none. Opt-in error reporting later, *only* over the configured VPN.
-5. **VPN provider strategy** *(deferred — pick before M4)*. Three orthogonal questions to resolve together:
-   - **Cloudflare WARP fallback.** Add as a one-click "I just want it on" option using `wgcf`-generated WireGuard configs? Free tier, useful when a hotel blocks the user's primary VPN. Marginal cost; risk is users misreading "WARP" as "real VPN."
-   - **ProtonVPN account login.** Implement Proton's SRP auth + WireGuard provisioning so users can log in with their Proton credentials and pick servers from the live list — like the desktop app — instead of hand-importing dozens of static `.conf` files. Significant work (SRP, session storage, server list UI), highest UX payoff for users who already pay for Proton.
-   - **Plugin shape for `bubble-vpnd`.** Whatever we decide, the daemon should grow a `provider` interface (`register → list_servers → connect → disconnect → status`) so adding Mullvad / iVPN / etc. is additive, not a rewrite.
+5. **VPN provider strategy** *(partially resolved)*.
+   - **v1.0:** WireGuard-only, but as a *pool of saved configs* with active probing — user imports N `.conf` files once, the daemon TCP-connects to each endpoint at connect time and picks the lowest RTT. Per-row enable toggle, "stale" indicator when a config stops handshaking, automatic fail-over to next candidate on three-strike failure. This delivers the "Quick Connect" UX from the Proton/Mullvad apps without an API integration, and the prober/selector code is exactly what the v1.1 provider plugins will reuse.
+   - **Post-v1.0 roadmap:** ProtonVPN account login (SRP auth + dynamic WG provisioning + live server list — see §11.5b). Cloudflare WARP fallback via `wgcf`-generated configs. Mullvad / iVPN as additional plugins. All of these become "config sources" feeding into the same pool + prober already shipping in v1.0.
+   - **Plugin shape for `bubble-vpnd`:** the daemon grows a `provider` interface (`list_servers → connect(target) → disconnect → status → pick_fastest(filters)`) so each post-1.0 provider is additive, not a rewrite. The v1.0 WG-pool implementation is the reference plugin.
 
 ## 12. Milestones
 
@@ -262,5 +262,6 @@ Anything else is denied. ACL files are versioned in this repo.
 - **M1 — frontend skeleton.** Svelte+Vite app with mock RPC, all screens stubbed, Nerd Font wired in.
 - **M2 — auth.** `bubble-authd` shell PoC against a real YubiKey on a Linux box (not router yet). Recovery code path tested.
 - **M3 — ubus wiring.** Run on a real OpenWRT device. Hotel WiFi + travel SSID screens functional.
-- **M4 — VPN + DNS.** WireGuard kill switch, DoH default. End-to-end on hardware.
-- **M5 — packaging.** `.ipk`, install docs, first tagged release.
+- **M4 — VPN + DNS.** WireGuard kill switch, DoH default. WG runs as a *pool of saved configs* with TCP-connect probing and `Connect to fastest` as the default action; auto fail-over to the next candidate on handshake failure. End-to-end on hardware.
+- **M5 — packaging.** `.ipk`, install docs, first tagged release (**v1.0**).
+- **M6+ — provider plugins.** ProtonVPN account login (SRP + dynamic WG provisioning), Cloudflare WARP fallback via `wgcf`, additional providers as community asks. Each one is a new source feeding the same pool + prober shipped in M4.
