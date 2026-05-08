@@ -1,2 +1,2 @@
 # BubbleUI
-Travel focused UI for OpenWRT
+Travel focused, security conscious UI for OpenWRT
