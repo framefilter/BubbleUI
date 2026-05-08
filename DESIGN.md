@@ -251,6 +251,10 @@ Anything else is denied. ACL files are versioned in this repo.
 2. **Setup-mode network.** Do we use the standard OpenWRT recovery `192.168.1.1`, or a less-collision-prone `192.168.111.1`?
 3. **Firmware update flow.** Out of scope for v0, but we should not regress sysupgrade.
 4. **Telemetry.** Default: none. Opt-in error reporting later, *only* over the configured VPN.
+5. **VPN provider strategy** *(deferred — pick before M4)*. Three orthogonal questions to resolve together:
+   - **Cloudflare WARP fallback.** Add as a one-click "I just want it on" option using `wgcf`-generated WireGuard configs? Free tier, useful when a hotel blocks the user's primary VPN. Marginal cost; risk is users misreading "WARP" as "real VPN."
+   - **ProtonVPN account login.** Implement Proton's SRP auth + WireGuard provisioning so users can log in with their Proton credentials and pick servers from the live list — like the desktop app — instead of hand-importing dozens of static `.conf` files. Significant work (SRP, session storage, server list UI), highest UX payoff for users who already pay for Proton.
+   - **Plugin shape for `bubble-vpnd`.** Whatever we decide, the daemon should grow a `provider` interface (`register → list_servers → connect → disconnect → status`) so adding Mullvad / iVPN / etc. is additive, not a rewrite.
 
 ## 12. Milestones
 
