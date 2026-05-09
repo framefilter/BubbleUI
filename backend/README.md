@@ -1,9 +1,16 @@
 # BubbleUI — backend
 
-Go services that back the BubbleUI web UI. `bubble-authd` runs the
-auth flows from `DESIGN.md` §5 (provision, log in, recover) and now
-exposes them over HTTP for the SPA. `ubus` integration lands in M3
-proper, alongside the rest of the network/firewall daemons.
+Go services that back the BubbleUI web UI.
+
+- `bubble-authd` — auth flows from DESIGN.md §5 (provision, log in,
+  recover, WebAuthn registration), exposed over HTTP for the SPA.
+- `bubble-vpnd` — DESIGN.md §6.2 / §11.5 VPN strategy: a pool of
+  saved WireGuard configs, parallel TCP-connect probing, "connect to
+  fastest" as the default action. wg-quick integration lives behind
+  a Connector interface; the dev binary uses StubConnector.
+
+`ubus` integration on the router lands in M3 proper. For now both
+daemons run as independent HTTP servers.
 
 ## Quick start
 
@@ -81,15 +88,20 @@ Touch the key when it blinks.
 ```
 backend/
 ├── cmd/
-│   └── bubble-authd/      CLI + HTTP server
+│   ├── bubble-authd/      auth daemon (CLI + HTTP)
+│   └── bubble-vpnd/       VPN daemon (HTTP, /vpn surface)
 ├── internal/
 │   ├── auth/              Provision/Login/Recover (YubiKey + WebAuthn)
 │   ├── crypto/            self-wrap (HMAC→HKDF→AES-256-GCM), recovery codes
-│   ├── store/             SQLite credentials.db (modernc.org/sqlite, no CGO)
+│   ├── store/             auth SQLite (credentials.db)
 │   ├── session/           HTTP session minting / validation / revocation
-│   ├── httpapi/           HTTP handlers + Origin/security middleware
+│   ├── httpapi/           bubble-authd HTTP handlers
 │   ├── webauthn/          go-webauthn wrapper + pending-flow state
-│   └── yubikey/           ykchalresp adapter + Mock for tests
+│   ├── yubikey/           ykchalresp/ykman adapters + Mock
+│   ├── wgpool/            VPN config SQLite + .conf parser
+│   ├── prober/            parallel TCP-connect probe
+│   ├── selector/          rank candidates by probe RTT
+│   └── vpnapi/            bubble-vpnd HTTP handlers + StubConnector
 └── go.mod
 ```
 
