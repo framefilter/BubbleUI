@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import { currentPath, navigate, onChange } from './lib/router';
   import { session, logout, refresh } from './lib/session.svelte';
+  import { startPolling } from './lib/netStore.svelte';
   import * as api from './lib/api';
   import { ICON } from './lib/icons';
 
@@ -12,6 +13,7 @@
   import Vpn from './routes/Vpn.svelte';
   import Ssid from './routes/Ssid.svelte';
   import Dns from './routes/Dns.svelte';
+  import SigninBanner from './components/SigninBanner.svelte';
 
   let path = $state(currentPath());
 
@@ -23,7 +25,12 @@
   onMount(() => {
     void api.timeSync(Date.now());
     void refresh();
-    return onChange((p) => (path = p));
+    const stopRouter = onChange((p) => (path = p));
+    const stopNetPoll = startPolling(5000);
+    return () => {
+      stopRouter();
+      stopNetPoll();
+    };
   });
 
   const s = session();
@@ -57,6 +64,8 @@
         <button onclick={logout} title="log out">{ICON.unlock}</button>
       </div>
     </header>
+
+    <SigninBanner />
 
     <nav>
       {#each nav as item}

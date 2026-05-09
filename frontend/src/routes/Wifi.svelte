@@ -1,6 +1,8 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { rpc } from '../lib/rpc';
+  import { net as netStore, refreshCaptive, refreshSignin, openSignin } from '../lib/netStore.svelte';
+  import * as api from '../lib/api';
   import { ICON } from '../lib/icons';
 
   interface ScanResult {
@@ -14,7 +16,15 @@
   let loading = $state(false);
   let connecting = $state<string | null>(null);
   let connected = $state<string | null>(null);
-  let captiveOpen = $state(false);
+  let captiveProbing = $state(false);
+  let opening = $state(false);
+  let signinError = $state('');
+
+  // Strict-mode toggle from §6.5. Lives here for now; if/when a Settings
+  // page lands it migrates there.
+  let strict = $state(false);
+
+  const ns = netStore();
 
   async function scan() {
     loading = true;
@@ -23,17 +33,47 @@
     if (r.ok) nets = r.data.results;
   }
 
-  async function connect(net: ScanResult) {
-    connecting = net.ssid;
+  async function probeCaptive() {
+    captiveProbing = true;
+    signinError = '';
+    await refreshCaptive();
+    captiveProbing = false;
+  }
+
+  async function openWindow() {
+    if (!ns.captive?.captive || (ns.captive.portal_ips ?? []).length === 0) {
+      signinError = 'no portal IPs detected; rerun the captive probe';
+      return;
+    }
+    opening = true;
+    signinError = '';
+    const r = await openSignin(ns.captive.portal_ips ?? [], 600);
+    opening = false;
+    if (!r.ok) signinError = r.error.error;
+  }
+
+  async function toggleStrict() {
+    strict = !strict;
+    const r = await api.netSigninStrict(strict);
+    if (!r.ok) {
+      signinError = r.error.error;
+      strict = !strict; // revert
+      return;
+    }
+    await refreshSignin();
+  }
+
+  async function connect(n: ScanResult) {
+    connecting = n.ssid;
     const r = await rpc.call<{ connected: boolean }>('wireless', 'connect', {
-      ssid: net.ssid,
-      encryption: net.encryption,
+      ssid: n.ssid,
+      encryption: n.encryption,
     });
     connecting = null;
     if (r.ok && r.data.connected) {
-      connected = net.ssid;
-      // Mock: any open network is "probably captive."
-      captiveOpen = net.encryption === 'open';
+      connected = n.ssid;
+      // After associating, immediately probe for a captive portal.
+      void probeCaptive();
     }
   }
 
@@ -44,7 +84,12 @@
     return '█   ';
   }
 
-  onMount(scan);
+  onMount(() => {
+    void scan();
+    void probeCaptive();
+    void refreshSignin();
+    if (ns.signin) strict = ns.signin.strict_mode;
+  });
 </script>
 
 <section>
@@ -61,16 +106,59 @@
       <div class="row">
         <span class="icon">{ICON.ok}</span>
         <strong>Connected to {connected}</strong>
+        <button onclick={probeCaptive} disabled={captiveProbing} class="reprobe">
+          <span class="icon" class:spin={captiveProbing}>{ICON.refresh}</span>
+          recheck
+        </button>
       </div>
-      {#if captiveOpen}
-        <p class="captive">
-          <span class="icon">{ICON.warn}</span>
-          Captive portal likely. Open the hotel login page to authenticate.
-        </p>
-        <button>Open hotel login</button>
-      {/if}
     </div>
   {/if}
+
+  {#if ns.captive?.captive && ns.signin?.state !== 'open'}
+    <div class="card captive">
+      <div class="row">
+        <span class="icon">{ICON.warn}</span>
+        <strong>Hotel WiFi requires sign-in</strong>
+      </div>
+      <p class="hint">
+        A captive portal is intercepting traffic. Detected at
+        <code>{(ns.captive.portal_ips ?? []).join(', ') || 'unknown IP'}</code>.
+      </p>
+      <p class="detail">
+        Opening the sign-in window adds a tightly-scoped firewall hole:
+        LAN→WAN to those IPs only, on TCP 80/443, for 10 minutes. The
+        kill switch stays in place for everything else.
+      </p>
+      <div class="actions">
+        <button onclick={openWindow} disabled={opening || ns.signin?.strict_mode}>
+          {opening ? 'opening…' : 'Open sign-in window (10 min)'}
+        </button>
+        {#if ns.signin?.strict_mode}
+          <span class="dim">(disabled by strict mode)</span>
+        {/if}
+      </div>
+      {#if signinError}
+        <p class="err"><span class="icon">{ICON.err}</span> {signinError}</p>
+      {/if}
+    </div>
+  {:else if ns.captive && !ns.captive.captive}
+    <div class="card clean">
+      <span class="icon">{ICON.ok}</span>
+      Internet looks fine — no captive portal detected.
+    </div>
+  {/if}
+
+  <label class="toggle strict">
+    <input type="checkbox" checked={ns.signin?.strict_mode ?? false} onchange={toggleStrict} />
+    <span>
+      <strong>Strict mode</strong>
+      <small>
+        Disable the captive-portal sign-in window entirely. With this on,
+        captive portals must be cleared via a separate dedicated SSID;
+        the kill switch is never relaxed. Recommended for high-threat trips.
+      </small>
+    </span>
+  </label>
 
   <ul class="list">
     {#each nets as net (net.bssid)}
@@ -131,8 +219,52 @@
     display: grid;
     gap: 8px;
   }
+  .card.captive {
+    background: var(--bg-elev);
+    border: 1px solid var(--accent-warn);
+    border-radius: var(--radius);
+    padding: 12px;
+    margin-bottom: 12px;
+    display: grid;
+    gap: 8px;
+  }
+  .card.captive .icon { color: var(--accent-warn); }
+  .card.clean {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: var(--bg-elev);
+    border: 1px solid var(--accent-ok);
+    border-radius: var(--radius);
+    padding: 8px 12px;
+    margin-bottom: 12px;
+    color: var(--accent-ok);
+    font-size: 13px;
+  }
   .row { display: flex; align-items: center; gap: 8px; }
-  .captive { color: var(--accent-warn); margin: 0; font-size: 13px; }
+  .row > strong { flex: 1; }
+  .hint { color: var(--fg-dim); font-size: 13px; margin: 0; line-height: 1.5; }
+  .detail { color: var(--fg-faint); font-size: 12px; margin: 0; line-height: 1.5; }
+  .err { color: var(--accent-err); font-size: 13px; margin: 0; }
+  .reprobe { background: transparent; border: 1px solid var(--border); padding: 4px 8px; font-size: 12px; }
+  .actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .dim { color: var(--fg-dim); font-size: 12px; }
+
+  .toggle.strict {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 12px;
+    align-items: start;
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 12px;
+    margin-bottom: 12px;
+    cursor: pointer;
+  }
+  .toggle.strict input { width: auto; margin-top: 4px; }
+  .toggle.strict small { display: block; color: var(--fg-dim); margin-top: 2px; line-height: 1.5; }
+  code { background: var(--bg); padding: 1px 4px; border-radius: 3px; }
   .spin { display: inline-block; animation: spin 1s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
 </style>
