@@ -13,6 +13,7 @@
 //	GET  /auth/session/whoami               — current session, if any
 //	POST /auth/session/logout               — revoke the current session
 //	GET  /auth/setup-status                 — has-any-credential gate for the wizard
+//	GET  /auth/health                       — credential + YubiKey-present (composer feed)
 //	POST /api/time/sync                     — browser-supplied time per §6.6
 //
 // Cookies: bubble-session, HttpOnly, SameSite=Strict, Secure (when TLS),
@@ -113,6 +114,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /auth/session/whoami", s.handleWhoami)
 	s.mux.HandleFunc("POST /auth/session/logout", s.handleLogout)
 	s.mux.HandleFunc("GET /auth/setup-status", s.handleSetupStatus)
+	s.mux.HandleFunc("GET /auth/health", s.handleHealth)
 	s.mux.HandleFunc("POST /api/time/sync", s.handleTimeSync)
 }
 
@@ -343,6 +345,30 @@ func (s *Server) handleSetupStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"has_credentials": has,
+	})
+}
+
+// handleHealth reports the live state of the auth daemon's
+// dependencies. Today that's just "is a YubiKey currently visible to
+// the router-side oracle?" which the bubble-hwd composer uses to
+// drive the §13.5 NoKey LED state. Reachable without auth: the
+// answer is non-secret (an attacker on the LAN can probe the USB
+// state by trying to log in anyway) and bubble-hwd has no session
+// to present.
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	hasCred, err := s.cfg.Auth.HasAnyCredential(r.Context())
+	if err != nil {
+		s.logger.Error("HasAnyCredential", "err", err)
+		writeError(w, http.StatusInternalServerError, "internal")
+		return
+	}
+	// "yubikey_present" is meaningful only when a YubiKey credential
+	// is registered AND the oracle is the live ykchalresp adapter
+	// (Mock always reports present for whatever it has plugged in).
+	yubiPresent := s.cfg.Auth.Yubi != nil && s.cfg.Auth.Yubi.Present(r.Context())
+	writeJSON(w, http.StatusOK, map[string]any{
+		"has_credentials": hasCred,
+		"yubikey_present": yubiPresent,
 	})
 }
 

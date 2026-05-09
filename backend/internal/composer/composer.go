@@ -10,13 +10,14 @@
 // State precedence, highest-wins:
 //
 //  1. SigninOpen   — captive-portal sign-in window is open (§6.5)
-//  2. Secured      — bubble-vpnd reports a tunnel is active
-//  3. Killswitch   — no tunnel + no sign-in window: LAN→WAN blocked
-//  4. Booting      — couldn't reach either daemon (best-effort fallback)
+//  2. NoKey        — credential registered but YubiKey not on USB
+//  3. Secured      — bubble-vpnd reports a tunnel is active
+//  4. Killswitch   — no tunnel + no sign-in window: LAN→WAN blocked
+//  5. Booting      — couldn't reach either daemon (best-effort fallback)
 //
-// "NoKey" and "Fault" states aren't yet wired; they'll come when
-// bubble-authd surfaces a /auth/health endpoint that reports whether
-// a registered YubiKey is present at the USB port.
+// NoKey is consulted via Source.AuthHealthURL. If that's unset (older
+// bubble-authd, or the operator opted out) the rule is skipped silently.
+// "Fault" is reserved for hardware faults we can't yet detect.
 package composer
 
 import (
@@ -35,6 +36,7 @@ import (
 type Source struct {
 	VPNStatusURL   string // e.g. "http://127.0.0.1:8766/vpn/status"
 	NetSigninURL   string // e.g. "http://127.0.0.1:8767/net/signin/status"
+	AuthHealthURL  string // e.g. "http://127.0.0.1:8765/auth/health" (optional)
 	HTTP           *http.Client
 	PerCallTimeout time.Duration // default 1s
 }
@@ -52,9 +54,8 @@ type Composer struct {
 	interval time.Duration
 	logger   *slog.Logger
 
-	mu      sync.Mutex
-	last    led.State
-	lastErr error
+	mu   sync.Mutex
+	last led.State
 }
 
 // Config carries deps + cadence.
@@ -135,6 +136,9 @@ func (c *Composer) compose(ctx context.Context) led.State {
 	if open, ok := c.signinOpen(ctx); ok && open {
 		return led.StateSigninOpen
 	}
+	if missing, ok := c.keyMissing(ctx); ok && missing {
+		return led.StateNoKey
+	}
 	if up, ok := c.tunnelUp(ctx); ok {
 		if up {
 			return led.StateSecured
@@ -157,6 +161,26 @@ func (c *Composer) signinOpen(ctx context.Context) (open bool, reachable bool) {
 		return false, false
 	}
 	return s.State == "open", true
+}
+
+// keyMissing reports whether bubble-authd has a credential registered
+// AND can no longer see the YubiKey on USB. ok=false when AuthHealthURL
+// isn't configured or the request fails — in either case the rule is
+// skipped (we don't want a transient netd hiccup to falsely flash NoKey).
+func (c *Composer) keyMissing(ctx context.Context) (missing bool, ok bool) {
+	if c.src.AuthHealthURL == "" {
+		return false, false
+	}
+	type healthResp struct {
+		HasCredentials bool `json:"has_credentials"`
+		YubiKeyPresent bool `json:"yubikey_present"`
+	}
+	var h healthResp
+	if err := getJSON(ctx, c.src.HTTP, c.src.AuthHealthURL, &h); err != nil {
+		c.logger.Debug("composer: auth health probe failed", "err", err)
+		return false, false
+	}
+	return h.HasCredentials && !h.YubiKeyPresent, true
 }
 
 func (c *Composer) tunnelUp(ctx context.Context) (up bool, reachable bool) {

@@ -39,7 +39,9 @@ Flags:
                       (default http://127.0.0.1:8766/vpn/status)
   -net-signin URL     bubble-netd signin URL for LED composition
                       (default http://127.0.0.1:8767/net/signin/status)
-  -compose-interval   how often to poll vpnd/netd (default 5s)
+  -auth-health URL    bubble-authd health URL — drives the NoKey LED
+                      (default http://127.0.0.1:8765/auth/health)
+  -compose-interval   how often to poll the daemons (default 5s)
   -no-compose         disable cross-daemon LED composition
   -h, --help          show this help
 
@@ -66,6 +68,7 @@ func run() error {
 		forceMock       bool
 		vpnStatusURL    string
 		netSigninURL    string
+		authHealthURL   string
 		composeInterval time.Duration
 		noCompose       bool
 		showHelp        bool
@@ -75,6 +78,7 @@ func run() error {
 	flag.BoolVar(&forceMock, "mock", false, "force mock implementations")
 	flag.StringVar(&vpnStatusURL, "vpn-status", "http://127.0.0.1:8766/vpn/status", "bubble-vpnd status URL")
 	flag.StringVar(&netSigninURL, "net-signin", "http://127.0.0.1:8767/net/signin/status", "bubble-netd signin URL")
+	flag.StringVar(&authHealthURL, "auth-health", "http://127.0.0.1:8765/auth/health", "bubble-authd health URL")
 	flag.DurationVar(&composeInterval, "compose-interval", 5*time.Second, "cross-daemon poll interval")
 	flag.BoolVar(&noCompose, "no-compose", false, "disable cross-daemon LED composition")
 	flag.BoolVar(&showHelp, "help", false, "show help")
@@ -141,8 +145,9 @@ func run() error {
 	if !noCompose {
 		comp := composer.New(composer.Config{
 			Source: composer.Source{
-				VPNStatusURL: vpnStatusURL,
-				NetSigninURL: netSigninURL,
+				VPNStatusURL:  vpnStatusURL,
+				NetSigninURL:  netSigninURL,
+				AuthHealthURL: authHealthURL,
 			},
 			Setter:   api,
 			Interval: composeInterval,

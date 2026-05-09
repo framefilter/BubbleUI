@@ -23,9 +23,8 @@ type LongPress struct {
 	button     Button
 	thresholds []time.Duration
 
-	out  chan Stage
-	now  func() time.Time
-	stop chan struct{}
+	out chan Stage
+	now func() time.Time
 
 	mu     sync.Mutex
 	closed bool
@@ -56,7 +55,6 @@ func NewLongPress(ctx context.Context, r Reader, button Button, thresholds []tim
 		thresholds: thresholds,
 		out:        make(chan Stage, 16),
 		now:        time.Now,
-		stop:       make(chan struct{}),
 	}
 	go lp.loop(ctx, r)
 	return lp

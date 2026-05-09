@@ -46,7 +46,12 @@
   function tunnelPill(): { text: string; cls: string } {
     if (!vpn) return { text: '…', cls: 'dim' };
     if (vpn.active_id) return { text: 'connected', cls: 'ok' };
-    return { text: 'disconnected', cls: 'err' };
+    // No active tunnel is the correct steady state when the user
+    // hasn't asked to connect yet — that's not an error condition,
+    // it's just the kill switch doing its job. Reserve red for
+    // states that actually need the user's attention.
+    if (poolSize === 0) return { text: 'no configs', cls: 'dim' };
+    return { text: 'disconnected', cls: 'warn' };
   }
 
   function signinPill(s: SigninStatus | null): { text: string; cls: string } {

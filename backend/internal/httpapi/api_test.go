@@ -566,6 +566,56 @@ func TestSetupStatusReflectsCredentialCount(t *testing.T) {
 	}
 }
 
+func TestHealthReportsYubiKeyAndCredentials(t *testing.T) {
+	rig := newRig(t)
+	c := rig.client(t)
+
+	// Fresh: no credentials, no key plugged in (Mock starts unplugged).
+	resp, err := c.Get(rig.server.URL + "/auth/health")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := decodeJSON(t, resp.Body)
+	resp.Body.Close()
+	if body["has_credentials"] != false {
+		t.Errorf("fresh: has_credentials = %v", body["has_credentials"])
+	}
+	if body["yubikey_present"] != false {
+		t.Errorf("fresh: yubikey_present = %v", body["yubikey_present"])
+	}
+
+	// Provision + program: Mock auto-plugs on Program(), so the key
+	// is reported present.
+	rig.provisionAndProgram(t)
+	resp2, err := c.Get(rig.server.URL + "/auth/health")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body = decodeJSON(t, resp2.Body)
+	resp2.Body.Close()
+	if body["has_credentials"] != true {
+		t.Errorf("post-provision: has_credentials = %v", body["has_credentials"])
+	}
+	if body["yubikey_present"] != true {
+		t.Errorf("post-provision: yubikey_present = %v", body["yubikey_present"])
+	}
+
+	// Unplug → yubikey_present flips back to false but credential row stays.
+	rig.mock.Unplug()
+	resp3, err := c.Get(rig.server.URL + "/auth/health")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body = decodeJSON(t, resp3.Body)
+	resp3.Body.Close()
+	if body["has_credentials"] != true {
+		t.Errorf("unplugged: has_credentials = %v", body["has_credentials"])
+	}
+	if body["yubikey_present"] != false {
+		t.Errorf("unplugged: yubikey_present = %v", body["yubikey_present"])
+	}
+}
+
 // --- WebAuthn endpoint tests ---
 
 func fakeWebAuthnCredentialBlob(t *testing.T, id []byte) []byte {
