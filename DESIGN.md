@@ -95,43 +95,74 @@ A simple, security-conscious web UI for OpenWRT travel routers.
 
 ### 5.1 Decisions
 
-- **Scope:** *all* UI access requires a key-backed session. No anonymous status page.
-- **Primary factor:** USB-attached YubiKey (or compatible: Nitrokey Pro/3, OnlyKey) on the **router**, via HMAC-SHA1 challenge-response (`ykchalresp`).
-- **Optional 2FA:** WebAuthn from the **client** browser (any FIDO2 authenticator). The user can enable this on the security page; the server treats it as an additional required factor.
-- **Recovery:** printed recovery code shown once at provisioning, BLAKE2s-hashed on disk, single-use to disable the key requirement.
-- **Note on PAM:** `pam_yubico` does support exactly this challenge-response model, but `uhttpd` doesn't authenticate through PAM. We replicate the model in `bubble-authd` rather than bolt PAM into the web stack.
+- **Scope:** *all* UI and SSH access requires a hardware-backed credential. No anonymous status page, no password fallback, no remote root.
+- **No passwords anywhere.** Not for the web UI, not for SSH. Authentication is purely hardware-backed.
+- **Factors (any registered credential is sufficient — they're co-equal, not primary/secondary):**
+  - **YubiKey on router USB** (or compatible: Nitrokey Pro/3, OnlyKey), via HMAC-SHA1 challenge-response (`ykchalresp`). The key lives plugged in.
+  - **WebAuthn from a registered browser** (Touch ID, Windows Hello, plugged-in FIDO2 key, etc.). Multiple devices can be registered; each is its own credential.
+- **Recovery:** a single 128-bit recovery code shown once at provisioning, BLAKE2s-hashed on disk, single-use, regenerable from settings (the old code is invalidated).
+- **No password recovery, no email reset, no support backdoor.** If the user loses every registered credential AND the recovery code, the only path is factory reset and re-provision. This is the right outcome for a travel router — the device holds little irreplaceable state.
+- **Note on PAM:** `pam_yubico` does support YubiKey HMAC challenge-response, but `uhttpd` doesn't authenticate through PAM. We replicate the model in `bubble-authd` rather than bolt PAM into the web stack.
 
 ### 5.2 Provisioning flow (first boot)
 
-1. Router boots into a one-time setup mode on `192.168.8.1`. Firewall blocks WAN until setup completes.
-2. User plugs in a YubiKey. Setup wizard:
-   - Generates a 20-byte random secret `S`.
-   - Writes `S` to YubiKey slot 2 (HMAC-SHA1, variable input).
-   - Stores `S` encrypted at rest under a key derived from the user's chosen admin password (Argon2id).
-   - Generates a 128-bit recovery code, displays it once, stores `BLAKE2s(code)` on disk.
-3. User sets admin password. Setup mode exits; future logins require key + password.
+1. Router boots into setup mode on `192.168.8.1`. Firewall blocks WAN until setup completes.
+2. Wizard requires the user to register **at least one** credential. Both factor types are co-equal:
+   - **YubiKey on router USB:** generate a 20-byte random secret `S`, write to slot 2 (HMAC-SHA1, variable input), store `S` self-wrapped (see §5.5).
+   - **WebAuthn from this browser:** standard `navigator.credentials.create()` with the user's choice of platform or cross-platform authenticator. Public key persisted to `/etc/bubble/credentials.db`.
+3. Wizard generates a 128-bit recovery code, displays it once, **requires the user to type it back** to confirm preservation.
+4. Setup mode exits; future access requires a registered credential.
 
 ### 5.3 Login flow
 
-1. User submits password over HTTPS.
-2. `bubble-authd` derives the at-rest key from the password (Argon2id), unwraps `S`.
-3. Daemon enumerates USB; if no compatible key present → reject.
-4. Daemon generates random 64-byte challenge `C`, calls `ykchalresp -2 C` against the device.
-5. Daemon recomputes `HMAC-SHA1(S, C)` locally and compares. Constant-time eq.
-6. On match, daemon calls `ubus call session login` and returns the session token to the browser as `HttpOnly; Secure; SameSite=Strict`.
-7. If WebAuthn 2FA is enabled, the SPA issues a `navigator.credentials.get()` challenge before any mutation; signed assertion is verified by `bubble-authd`.
+Two paths depending on which credential the user invokes; both yield the same session token.
+
+#### YubiKey-on-router
+
+1. SPA requests a session.
+2. `bubble-authd` shows "Touch the YubiKey on your router."
+3. Daemon enumerates USB; if no compatible key present → error.
+4. Daemon issues a fixed application-tagged challenge to recover `K_wrap` from the key, decrypts the stored ciphertext to obtain `S` in RAM (see §5.5).
+5. Daemon generates random 64-byte challenge `C`, calls `ykchalresp -2 C`.
+6. Daemon recomputes `HMAC-SHA1(S, C)` locally and compares constant-time.
+7. On match, mint session token, set cookie `HttpOnly; Secure; SameSite=Strict`.
+
+#### WebAuthn-from-browser
+
+1. SPA requests a session.
+2. Daemon issues a WebAuthn challenge listing all registered credential IDs.
+3. Browser prompts user via FIDO2 device.
+4. User taps; browser signs assertion.
+5. Daemon verifies signature against stored credential public key, constant-time.
+6. On match, mint session, set cookie.
 
 ### 5.4 Recovery flow
 
-1. User clicks "Lost my key" on the login page.
-2. Enters admin password + the printed recovery code.
-3. Server checks `BLAKE2s(code)` against stored hash, in constant time.
-4. If valid, the code is **burned** (replaced with random bytes), the key requirement is disabled, and the UI forces the user to re-provision before any other action.
+1. User clicks "Lost my keys" on the login page.
+2. Enters the printed recovery code.
+3. Server checks `BLAKE2s(code)` against the stored hash, constant-time.
+4. If valid, the code is **burned** (replaced with random bytes), all registered credentials are wiped, the device returns to setup mode, and the user re-provisions from scratch.
+5. **Trip configs survive** — WG configs, SSID names, DNS provider, etc. are not bound to auth and are preserved across recovery. Only credentials and the recovery code are reset.
 
-### 5.5 What this does *not* protect against
+There is no other recovery path. Lose all credentials *and* the recovery code → factory reset. This is intentional and stated up front.
 
-- An attacker with physical access to both the router and the key. (Mitigation: admin password is still required.)
-- A YubiKey with a known-weak slot 2 secret pre-provisioned by a hostile party. (Mitigation: always provision from setup mode on a fresh router.)
+### 5.5 At-rest protection of router-side secrets
+
+The YubiKey slot 2 secret `S` is the most sensitive on-device credential — it's what authenticates the router to the user's key. With no password to derive a wrapping key from, we **self-wrap with the key**:
+
+- At provisioning, after writing `S` to slot 2, the daemon computes `K_wrap = HMAC-SHA1(S, "bubble-at-rest-v1")` (a fixed application-tagged challenge), encrypts `S` with `K_wrap` (AES-256-GCM, random nonce), and stores ciphertext + nonce in `/etc/bubble/credentials.db`. `S` is then zeroed from RAM.
+- At login, the daemon sends the same fixed challenge to the plugged-in YubiKey, receives `K_wrap`, decrypts the stored ciphertext to recover `S`.
+
+Net effect: physical theft of the router *without* the YubiKey yields no usable `S`. The threat model is unchanged for the case where both are stolen — but that's not worse than before, and it's strictly better than storing `S` in plaintext.
+
+For WebAuthn-only setups there is no `S`. Only credential public keys are stored; those are public by definition.
+
+### 5.6 What this does *not* protect against
+
+- An attacker with physical access to both the router and a registered key.
+- An attacker who has both a user's laptop *and* the means to satisfy its registered authenticator (biometric, PIN, plugged-in key).
+- A YubiKey with a known-weak slot 2 secret pre-provisioned by a hostile party. Mitigation: always provision from setup mode on a fresh router.
+- An attacker with the printed recovery code. Mitigation: store the code separately from the router and treat it as a backup credential, not paperwork to file with the device manual.
 
 ## 6. MVP features
 
@@ -289,6 +320,53 @@ A future v1.x feature could ship a per-router cert installable into the user's t
 - **Persistence cadence:** every 5 min during operation, plus on clean shutdown.
 - **Cert strategy:** self-signed broad-validity for v1.0; per-router-installable for v1.x.
 
+### 6.7 First-boot wizard
+
+The wizard runs in setup mode (`192.168.8.1`, WAN blocked). It walks the user from a freshly flashed device to a working BubbleUI in roughly three minutes. State persists server-side; closing the browser mid-wizard is safe; reboot during the wizard returns to the same state.
+
+#### Steps
+
+1. **Welcome.** "BubbleUI setup. About 3 minutes."
+2. **Time check.** Silent if the browser's clock and the router's persisted clock agree within 5 min (§6.6); otherwise prompts.
+3. **Register a security key** *(required, ≥1)*. Two co-equal options:
+   - YubiKey on router USB — one click programs slot 2 (§5.2).
+   - WebAuthn from this browser — Touch ID, Windows Hello, plugged-in FIDO2 key.
+   Additional credentials can be registered later from settings.
+4. **Recovery code** *(required)*. Generated server-side, displayed once, **typed back to confirm preservation**. The "I've written it down" path is intentionally not just a click — the recovery code is the *only* fallback if all credentials are lost (§5.4).
+5. **WireGuard configs** *(optional)*. Drag-drop or paste any number of configs into the pool. Skippable; addable later from VPN settings. Background prober and "fastest" selection apply automatically once the pool has ≥1 entry.
+6. **Uplink** *(optional)*. "Connect this router to the internet now, or skip and set up at the hotel."
+   - WiFi (scan + pick + password)
+   - Wired (instructions to plug WAN port)
+   - Skip
+7. **SSH access** *(optional)*. Off by default. To enable, paste an SSH public key:
+   - Strongly recommended: `ssh-keygen -t ed25519-sk -O resident -f ~/.ssh/bubble_sk` (FIDO2-backed; touching the security key is required for every connection).
+   - Plain `ed25519` keys accepted but not recommended.
+   - Password auth and root login are never offered.
+   - SSH binds only to the LAN side; never reachable from WAN.
+   Skippable; can be enabled later from settings.
+8. **Done.** Brief status snapshot. Setup mode exits; firewall transitions to its normal posture.
+
+#### Setup-mode exit conditions
+
+Setup mode is considered complete when:
+
+- ≥1 security credential is registered, **and**
+- the recovery code has been displayed *and* typed back successfully.
+
+Steps 5, 6, and 7 are all optional — users who skip them land in a perfectly usable BubbleUI that simply hasn't connected to anything yet, has no WG configs, and has no SSH enabled.
+
+#### Resumability
+
+Wizard state persists in `/etc/bubble/setup-state.json`. Closing the browser mid-wizard returns to the same step on next visit. Wizard step N is idempotent — re-running it has no side effects beyond what it would do the first time.
+
+#### Wizard skip ≠ feature missing
+
+Anything skipped in the wizard is reachable from the regular UI. The wizard is a convenience layer for first-time setup; it is not the only path to any feature.
+
+#### SSH server choice
+
+Default `dropbear` configured with `PasswordAuth no`, `RootLogin no`, key-based only. If `dropbear` proves to lag on `sk-*` key support, swap to `openssh-server` (~1 MB extra footprint). Decision deferred to M2 testing on real hardware.
+
 ## 7. Frontend
 
 ### 7.1 Stack
@@ -326,10 +404,11 @@ Body text uses the same monospace at 14 px / 1.55 line-height. Going monospace-o
 
 | Component | Language | Role |
 |---|---|---|
-| `bubble-authd` | shell + `ykchalresp` (v0); Go (v1) | YubiKey challenge, password verification, session minting |
+| `bubble-authd` | shell + `ykchalresp` (v0); Go (v1) | YubiKey HMAC challenge, WebAuthn assertion verification, recovery-code burn, session minting |
 | `bubble-rpcd-acl` | JSON | ACL files declaring exactly which `ubus` paths the UI may call |
 | `bubble-uhttpd-conf` | uhttpd config | Serves SPA, terminates TLS, proxies `/ubus` and `/auth` |
-| `bubble-setup` | shell | First-boot wizard helper, drives provisioning |
+| `bubble-setup` | shell | First-boot wizard helper (§6.7), drives provisioning |
+| `bubble-hwd` | Go | Hardware adapter — LED, GPIO, USB enumeration. Reference impl targets the AXT1800; new devices add a new adapter (§13.6) |
 
 ### 8.2 ACL surface (initial draft)
 
@@ -374,10 +453,10 @@ Anything else is denied. ACL files are versioned in this repo.
 
 ## 11. Open questions
 
-1. **WebAuthn key material storage.** Where do we store registered credential public keys — UCI, or a small SQLite DB? UCI is the OpenWRT-native answer but is awkward for binary blobs.
+1. **Credential storage.** *Resolved:* a small SQLite DB at `/etc/bubble/credentials.db` holding all credential types (YubiKey-self-wrapped `S` ciphertext, WebAuthn credential public keys + IDs, recovery code BLAKE2s hash). UCI is unsuitable for the binary blobs WebAuthn requires; SQLite is small enough to be unobtrusive on the AXT1800.
 2. **Setup-mode network.** *Resolved:* `192.168.8.1` (the GL.iNet hardware default; minimizes collisions with hotel/home networks that almost universally use `192.168.0/1.x`). See §6.6.
-3. **Firmware update flow.** Out of scope for v0, but we should not regress sysupgrade.
-4. **Telemetry.** Default: none. Opt-in error reporting later, *only* over the configured VPN.
+3. **Firmware update flow.** Out of scope for *now*, not forever. We keep `sysupgrade` compatibility intact (don't write to flash regions it expects to manage, don't break the standard upgrade tarball format) so a managed upgrade path can land cleanly post-v1.0.
+4. **Telemetry.** *Resolved:* none, ever. No counters, no error reporting, no opt-in. Crash diagnostics are surfaced in-product via a "Report issue" button that bundles redacted logs (system + daemon logs, sanitized firewall/network state, redacted config) into a downloadable file and pre-fills a GitHub issue template. The user reviews and submits manually. No callback URL, no automatic upload.
 5. **VPN provider strategy** *(partially resolved)*.
    - **v1.0:** WireGuard-only, but as a *pool of saved configs* with active probing — user imports N `.conf` files once, the daemon TCP-connects to each endpoint at connect time and picks the lowest RTT. Per-row enable toggle, "stale" indicator when a config stops handshaking, automatic fail-over to next candidate on three-strike failure. This delivers the "Quick Connect" UX from the Proton/Mullvad apps without an API integration, and the prober/selector code is exactly what the v1.1 provider plugins will reuse.
    - **Post-v1.0 roadmap:** ProtonVPN account login (SRP auth + dynamic WG provisioning + live server list — see §11.5b). Cloudflare WARP fallback via `wgcf`-generated configs. Mullvad / iVPN as additional plugins. All of these become "config sources" feeding into the same pool + prober already shipping in v1.0.
