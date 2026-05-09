@@ -1,0 +1,49 @@
+#!/bin/sh /etc/rc.common
+# bubble-authd — BubbleUI auth daemon (DESIGN.md §5).
+#
+# Runs as root for now. Privilege separation is a planned post-1.0
+# refactor (see backend/README.md "What's not yet wired").
+
+USE_PROCD=1
+START=95
+STOP=05
+
+NAME=bubble-authd
+PROG=/usr/sbin/bubble-authd
+
+start_service() {
+	. /lib/functions.sh
+	config_load bubbleui
+
+	local listen rp_id allow_set_time db
+	config_get listen     server listen     '127.0.0.1:8765'
+	config_get rp_id      server rp_id      'bubble.local'
+	config_get allow_set_time server allow_set_time '1'
+	config_get db         server auth_db    '/etc/bubble/credentials.db'
+
+	mkdir -p "$(dirname "$db")"
+
+	procd_open_instance "$NAME"
+	procd_set_param command "$PROG" \
+		-db "$db" \
+		serve \
+		-listen "$listen" \
+		-rp-id "$rp_id"
+	[ "$allow_set_time" = "1" ] && \
+		procd_append_param command -allow-set-time
+
+	procd_set_param respawn 3600 5 0
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_set_param file /etc/config/bubbleui
+	procd_close_instance
+}
+
+reload_service() {
+	stop
+	start
+}
+
+service_triggers() {
+	procd_add_reload_trigger bubbleui
+}
