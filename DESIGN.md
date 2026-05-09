@@ -462,6 +462,11 @@ Anything else is denied. ACL files are versioned in this repo.
    - **Post-v1.0 roadmap:** ProtonVPN account login (SRP auth + dynamic WG provisioning + live server list — see §11.5b). Cloudflare WARP fallback via `wgcf`-generated configs. Mullvad / iVPN as additional plugins. All of these become "config sources" feeding into the same pool + prober already shipping in v1.0.
    - **Plugin shape for `bubble-vpnd`:** the daemon grows a `provider` interface (`list_servers → connect(target) → disconnect → status → pick_fastest(filters)`) so each post-1.0 provider is additive, not a rewrite. The v1.0 WG-pool implementation is the reference plugin.
 
+6. **MAC and hostname privacy** *(deferred — v1.x)*. The default OpenWRT hostname (`OpenWrt`) and a stable WAN MAC are a fingerprint that follows the user from network to network. §6.5 already pins stable-per-SSID as the WAN MAC baseline (a fresh MAC each time the user connects to a new upstream SSID). This adds three layered extensions:
+   - **Time-based rotation** *(opt-in)*. Rotate all interface MACs — WAN-side STA, travel-SSID AP, LAN — on a user-configurable cadence. Pre-canned presets: 24h (the Apple iOS Private Wi-Fi Address default), 7d, 30d. Custom interval allowed. Rotation fires on a tick boundary, not mid-association — an active connection survives until the next reconnect. Stable-per-SSID remains the default; time-based stacks on top.
+   - **OUI picker** *(opt-in)*. Replace locally-administered random MACs (first byte `0x02`/`0x06`/`0x0a`/`0x0e`, which some networks treat as suspicious) with a vendor OUI of the user's choice. Curated list bundled in firmware (Apple, Samsung, Intel, etc.); first three bytes fixed, last three randomized per rotation.
+   - **Hostname privacy** *(default-on)*. The default hostname is *never* `OpenWrt`. Wizard picks a neutral default at setup, or one that pattern-matches the selected OUI (`iPhone` for an Apple OUI, `Galaxy` for Samsung, etc.). User can override with any string at any time. The DHCP client identifier and mDNS broadcasts share the hostname, so this single setting covers all the obvious leak points.
+
 ## 12. Milestones
 
 - **M0 — this doc.** Design freeze, repo scaffold lands.
@@ -471,6 +476,7 @@ Anything else is denied. ACL files are versioned in this repo.
 - **M4 — VPN + DNS.** WireGuard kill switch, DoH default. WG runs as a *pool of saved configs* with TCP-connect probing and `Connect to fastest` as the default action; auto fail-over to the next candidate on handshake failure. End-to-end on hardware.
 - **M5 — packaging.** `.ipk`, install docs, first tagged release (**v1.0**).
 - **M6+ — provider plugins.** ProtonVPN account login (SRP + dynamic WG provisioning), Cloudflare WARP fallback via `wgcf`, additional providers as community asks. Each one is a new source feeding the same pool + prober shipped in M4.
+- **M7 — privacy hardening.** Time-based MAC rotation, OUI picker, hostname privacy — see §11.6.
 
 ## 13. Hardware target
 
