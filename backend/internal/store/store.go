@@ -67,6 +67,11 @@ func Open(ctx context.Context, path string) (*Store, error) {
 // Close releases the underlying database handle.
 func (s *Store) Close() error { return s.db.Close() }
 
+// DB returns the underlying *sql.DB so other packages (e.g. session)
+// can share the same SQLite connection. Callers must not close it; the
+// store owns the lifetime.
+func (s *Store) DB() *sql.DB { return s.db }
+
 func (s *Store) migrate(ctx context.Context) error {
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS credentials (
