@@ -39,11 +39,11 @@ func TestRecoveryCodeNormalization(t *testing.T) {
 	hash, _ := HashRecoveryCode(code)
 
 	cases := []string{
-		strings.ToLower(code),                 // lowercase
-		strings.ReplaceAll(code, "-", ""),     // dashes stripped
-		strings.ReplaceAll(code, "-", " "),    // dashes -> spaces
+		strings.ToLower(code),                  // lowercase
+		strings.ReplaceAll(code, "-", ""),      // dashes stripped
+		strings.ReplaceAll(code, "-", " "),     // dashes -> spaces
 		strings.ReplaceAll(code, "-", "  -  "), // weird spacing
-		" " + code + " ",                      // surrounding whitespace
+		" " + code + " ",                       // surrounding whitespace
 	}
 	for _, c := range cases {
 		ok, err := VerifyRecoveryCode(c, hash)
