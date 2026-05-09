@@ -212,6 +212,83 @@ The "where the user signs in" surface in `bubble-netd` is a pluggable interface.
 
 Router-as-portal-proxy: an HTML proxy that fetches and rewrites the portal page through BubbleUI's own UI, eliminating the LAN exposure window for the portals it can handle. Falls back to the v1.0 firewall-hole flow when the proxy can't handle a particular portal (JS-heavy SPAs, OAuth-style identity-provider redirects, etc.). Explicitly *not* a v1.0 commitment — explore if the v1.0 flow proves annoying on real trips.
 
+### 6.6 Boot sequence and time bootstrapping
+
+The reference hardware (§13) has no battery-backed RTC. On cold boot, the system clock sits at the kernel build date — effectively "the past." TLS validation against any cert with a `notBefore` after that date fails, which means **DoH cannot establish, all DNS dies, and the user sees no internet** until time is set. WireGuard itself is time-tolerant (it requires monotonic time, not correct time) so the tunnel survives bad clocks; DoH is the acute failure mode.
+
+#### Bootstrap order
+
+```
+Boot
+  ├─ 1. Restore last-known time from /etc/bubble/last-time
+  │     clock = max(stored, kernel_build_date)
+  │     guarantees: time is "approximately correct, never in the past"
+  │
+  ├─ 2. LAN up (192.168.8.1, dnsmasq for local resolution)
+  │     user can reach BubbleUI immediately
+  │     kill switch fully closed; no LAN→WAN forwarding
+  │
+  ├─ 3. User opens BubbleUI on a device
+  │     SPA POSTs Date.now() to /api/time/sync
+  │     router accepts if within ±5 min of stored time, else prompts user
+  │     time is now correct; persisted to flash
+  │
+  ├─ 4. WAN up (associate with hotel SSID, DHCP)
+  ├─ 5. Captive-portal sign-in window if needed (§6.5)
+  ├─ 6. DoH up (TLS validation works)
+  └─ 7. WG up; status pill goes secured
+```
+
+#### Why browser-supplied time, not NTP
+
+The user's laptop already has correct time — generally NTS-validated and OS-corrected. Borrowing it via the browser:
+
+- requires zero network bootstrap on the router (no chicken-and-egg);
+- requires no NTP server allowlist or IP pinning;
+- requires no NTS implementation;
+- avoids "hostile hotel pushes wrong time" attacks (the laptop's clock isn't on hotel WiFi);
+- is more trustworthy than NTP from a random pool server.
+
+NTP becomes a **nice-to-have background sync** for unattended reboots, not a critical path. Runs once per hour via `busybox ntpd` if a network is reachable; failure is silent.
+
+#### Browser-time accept/prompt logic
+
+- **Auto-accept** if `|browser_time − router_time| < 5 min`. Just write to flash and persist.
+- **Prompt** otherwise:
+
+  ```
+  ⚠ Router clock differs from your device by 2 days.
+     Your device says: 2026-05-09 14:32:18 UTC
+     Router thinks:    2026-05-07 21:14:02 UTC
+     [ Sync to device clock ]   [ Keep router clock ]
+  ```
+
+- "Keep router clock" path is for the rare case where the user knows their device's clock is wrong (loaner laptop, intentionally time-shifted test device).
+
+#### Persistence
+
+- Write `/etc/bubble/last-time` every 5 min during normal operation.
+- Write on clean shutdown via init script.
+- On boot, clamp to `max(stored, build_date)` so a regressing clock can never make WG drop or certs appear future-invalid.
+
+#### BubbleUI's own HTTPS cert
+
+Self-signed, broad validity:
+
+- `notBefore = 2020-01-01`, `notAfter = 2099-01-01`. Time-set state of the router doesn't affect cert validity.
+- Generated once at provisioning, stored in `/etc/bubble/ui.pem`.
+- CN = `bubble.local`, SAN includes the LAN IP (`192.168.8.1`).
+- Browser warns once on first connect; user accepts the exception. Subsequent visits are silent.
+
+A future v1.x feature could ship a per-router cert installable into the user's trust store via QR code, eliminating the warning. Out of scope for v1.0.
+
+#### Decisions pinned
+
+- **Time source:** browser-supplied, primary. NTP is fallback, optional, background-only.
+- **Tolerance:** ±5 min for silent accept, otherwise prompt.
+- **Persistence cadence:** every 5 min during operation, plus on clean shutdown.
+- **Cert strategy:** self-signed broad-validity for v1.0; per-router-installable for v1.x.
+
 ## 7. Frontend
 
 ### 7.1 Stack
@@ -293,12 +370,12 @@ Anything else is denied. ACL files are versioned in this repo.
 
 - Frontend: `pnpm build` produces `dist/` with hashed assets.
 - Package: standard OpenWRT `Makefile` builds `bubbleui_<ver>_all.ipk`. Install via `opkg install`.
-- Hardware test matrix (eventually): GL-MT3000 (Beryl AX), GL-MT2500 (Brume 2), generic ath79 device.
+- **Hardware:** GL-AXT1800 (Slate AX) running **vanilla OpenWRT 23.05+**. GL.iNet's stock firmware is explicitly out of scope. See §13.
 
 ## 11. Open questions
 
 1. **WebAuthn key material storage.** Where do we store registered credential public keys — UCI, or a small SQLite DB? UCI is the OpenWRT-native answer but is awkward for binary blobs.
-2. **Setup-mode network.** Do we use the standard OpenWRT recovery `192.168.1.1`, or a less-collision-prone `192.168.111.1`?
+2. **Setup-mode network.** *Resolved:* `192.168.8.1` (the GL.iNet hardware default; minimizes collisions with hotel/home networks that almost universally use `192.168.0/1.x`). See §6.6.
 3. **Firmware update flow.** Out of scope for v0, but we should not regress sysupgrade.
 4. **Telemetry.** Default: none. Opt-in error reporting later, *only* over the configured VPN.
 5. **VPN provider strategy** *(partially resolved)*.
@@ -315,3 +392,66 @@ Anything else is denied. ACL files are versioned in this repo.
 - **M4 — VPN + DNS.** WireGuard kill switch, DoH default. WG runs as a *pool of saved configs* with TCP-connect probing and `Connect to fastest` as the default action; auto fail-over to the next candidate on handshake failure. End-to-end on hardware.
 - **M5 — packaging.** `.ipk`, install docs, first tagged release (**v1.0**).
 - **M6+ — provider plugins.** ProtonVPN account login (SRP + dynamic WG provisioning), Cloudflare WARP fallback via `wgcf`, additional providers as community asks. Each one is a new source feeding the same pool + prober shipped in M4.
+
+## 13. Hardware target
+
+**Reference device: GL.iNet GL-AXT1800 (Slate AX), running vanilla OpenWRT.**
+
+Chosen because it's the cleanest VPN-capable travel router in its segment: vanilla OpenWRT support is mature (`qualcommax/ipq60xx` target), the USB 3.0 port is well-suited for an always-attached YubiKey, and the WiFi 6 dual-radio config supports simultaneous AP+STA on different bands without contention.
+
+### 13.1 Specs
+
+| | |
+|---|---|
+| SoC | Qualcomm IPQ6000 (4× ARM Cortex-A53, ARMv8) |
+| RAM | 512 MB DDR3L |
+| Flash | 128 MB NAND |
+| WiFi | 802.11ax dual-band 2×2 — 574 Mbps @ 2.4 GHz, 1201 Mbps @ 5 GHz |
+| Wired | 1× Gigabit WAN, 1× Gigabit LAN |
+| USB | 1× USB 3.0 type-A (always-attached YubiKey lives here) |
+| Power | USB-C, 5 V / 3 A |
+| LED | 1× multi-color (top) |
+| RTC | none — see §6.6 |
+
+### 13.2 Firmware base — vanilla OpenWRT only
+
+**Vanilla OpenWRT 23.05 or later. GL.iNet's stock firmware is explicitly out of scope and not supported.**
+
+Reasons, not tradeoffs:
+
+- GL.iNet's firmware is a heavily customized OpenWRT fork with uneven update cadence. Vanilla gets reliable security updates from upstream.
+- We don't want to inherit GL.iNet's UI, their bundled apps, their telemetry, or their WAN-side cloud features.
+- Portability: anything we build on vanilla works on every other OpenWRT-supported device with comparable resources, which is good hygiene even though we only target one device today.
+- The AXT1800's hardware quirks (Mode switch, LED, button) become generic GPIOs we bind ourselves in `bubble-hwd`. Small upfront cost, total control.
+
+### 13.3 Resource budgets
+
+| | |
+|---|---|
+| Frontend bundle (HTML+JS+CSS+font) | < 400 KB target, ~200 KB realistic |
+| Each Go daemon, stripped | 3-6 MB |
+| Total BubbleUI install footprint | < 25 MB on flash |
+| BubbleUI RAM at idle (all daemons) | < 50 MB |
+
+Leaves comfortable headroom for OpenWRT, dnsmasq, hostapd, wireguard tools, and trip configurations on a 128 MB / 512 MB device.
+
+### 13.4 Radio plan
+
+- **Travel SSID (AP):** 5 GHz default. Less congested in hotels, faster, supports more devices.
+- **Hotel uplink (STA):** 2.4 GHz default. Better penetration, more universally available.
+- User can swap in settings if a particular trip's hotel is 5 GHz only.
+
+### 13.5 LED behavior
+
+| State | LED |
+|---|---|
+| Setup mode | solid blue |
+| Booting | white pulse |
+| Tunnel up, secured | solid green |
+| Captive-portal sign-in window open (§6.5) | slow yellow blink |
+| Tunnel down, kill switch active | slow red blink |
+| Hardware fault / YubiKey expected but missing | fast red blink |
+
+### 13.6 Portability
+
+Hardware-touching code (LED, GPIO, USB enumeration paths) lives in a single `bubble-hwd` adapter. Supporting another OpenWRT device is a matter of writing a new adapter, not rewriting the daemons. But the AXT1800 is the *only* device tested or supported in v1.0; everything else is best-effort and explicitly unsupported.
