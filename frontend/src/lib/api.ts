@@ -238,3 +238,20 @@ export const netSigninClose = () =>
 
 export const netSigninStrict = (enabled: boolean) =>
   request<{ strict_mode: boolean }>('POST', '/net/signin/strict', { enabled });
+
+// --- Hardware (bubble-hwd) ---
+
+export type LEDState =
+  | 'off'
+  | 'booting'
+  | 'setup'
+  | 'secured'
+  | 'killswitch_up'
+  | 'signin_open'
+  | 'no_key'
+  | 'fault'
+  | 'unknown';
+
+export const hwLEDGet = () => request<{ state: LEDState }>('GET', '/hw/led');
+export const hwLEDSet = (state: LEDState) =>
+  request<{ state: LEDState }>('POST', '/hw/led', { state });

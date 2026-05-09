@@ -1,92 +1,203 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
-  import { rpc } from '../lib/rpc';
+  import { onMount, onDestroy } from 'svelte';
+  import * as api from '../lib/api';
+  import type { VPNStatus, SigninStatus, LEDState, Whoami } from '../lib/api';
+  import { net as netStore } from '../lib/netStore.svelte';
   import { ICON } from '../lib/icons';
 
-  interface Board { model: string; release: { version: string } }
-  interface SysInfo { uptime: number; load: number[]; memory: { total: number; free: number } }
-  interface WgStatus { up: boolean; peer: string | null; handshake_age: number | null }
-  interface DnsStatus { provider: string; mode: 'doh' | 'dot'; enforced: boolean }
+  // Aggregates state from all four daemons:
+  //   bubble-authd   /auth/session/whoami        — credential ID + expiry
+  //   bubble-vpnd    /vpn/status, /vpn/configs   — tunnel + pool size
+  //   bubble-netd    (via netStore poll)         — sign-in + captive
+  //   bubble-hwd     /hw/led                     — composed LED state
+  let vpn = $state<VPNStatus | null>(null);
+  let poolSize = $state<number>(0);
+  let led = $state<LEDState>('unknown');
+  let who = $state<Whoami | null>(null);
 
-  let board = $state<Board | null>(null);
-  let info = $state<SysInfo | null>(null);
-  let wg = $state<WgStatus | null>(null);
-  let dns = $state<DnsStatus | null>(null);
+  let loadedAt = $state<number>(0);
+  let intervalId: ReturnType<typeof setInterval> | null = null;
 
-  onMount(async () => {
-    const [b, i, w, d] = await Promise.all([
-      rpc.call<Board>('system', 'board'),
-      rpc.call<SysInfo>('system', 'info'),
-      rpc.call<WgStatus>('wireguard', 'status'),
-      rpc.call<DnsStatus>('dns', 'status'),
+  const ns = netStore();
+
+  async function refresh() {
+    const [vpnStatus, vpnList, ledRes, whoRes] = await Promise.all([
+      api.vpnStatus(),
+      api.vpnList(),
+      api.hwLEDGet(),
+      api.whoami(),
     ]);
-    if (b.ok) board = b.data;
-    if (i.ok) info = i.data;
-    if (w.ok) wg = w.data;
-    if (d.ok) dns = d.data;
+    if (vpnStatus.ok) vpn = vpnStatus.data;
+    if (vpnList.ok) poolSize = vpnList.data.configs?.length ?? 0;
+    if (ledRes.ok) led = ledRes.data.state;
+    if (whoRes.ok) who = whoRes.data;
+    loadedAt = Date.now();
+  }
+
+  onMount(() => {
+    void refresh();
+    intervalId = setInterval(refresh, 5000);
   });
 
-  function fmtUptime(s: number): string {
-    const d = Math.floor(s / 86400);
-    const h = Math.floor((s % 86400) / 3600);
-    const m = Math.floor((s % 3600) / 60);
-    return `${d}d ${h}h ${m}m`;
+  onDestroy(() => {
+    if (intervalId !== null) clearInterval(intervalId);
+  });
+
+  function tunnelPill(): { text: string; cls: string } {
+    if (!vpn) return { text: '…', cls: 'dim' };
+    if (vpn.active_id) return { text: 'connected', cls: 'ok' };
+    return { text: 'disconnected', cls: 'err' };
+  }
+
+  function signinPill(s: SigninStatus | null): { text: string; cls: string } {
+    if (!s) return { text: '…', cls: 'dim' };
+    if (s.state === 'open') return { text: 'sign-in open', cls: 'warn' };
+    if (s.strict_mode) return { text: 'strict', cls: 'ok' };
+    return { text: 'kill switch', cls: 'ok' };
+  }
+
+  function captivePill() {
+    if (!ns.captive) return { text: '…', cls: 'dim' };
+    if (ns.captive.captive) return { text: 'portal detected', cls: 'warn' };
+    return { text: 'clear', cls: 'ok' };
+  }
+
+  function ledColor(s: LEDState): string {
+    switch (s) {
+      case 'secured':
+        return 'var(--accent-ok)';
+      case 'signin_open':
+      case 'setup':
+        return 'var(--accent-warn)';
+      case 'killswitch_up':
+      case 'no_key':
+      case 'fault':
+        return 'var(--accent-err)';
+      case 'booting':
+        return 'var(--fg-dim)';
+      default:
+        return 'var(--fg-faint)';
+    }
+  }
+
+  function fmtExpiry(ts: number): string {
+    const sec = Math.max(0, Math.floor(ts - Date.now() / 1000));
+    const h = Math.floor(sec / 3600);
+    const m = Math.floor((sec % 3600) / 60);
+    if (h > 24) return Math.floor(h / 24) + 'd ' + (h % 24) + 'h';
+    if (h > 0) return h + 'h ' + m + 'm';
+    return m + 'm';
+  }
+
+  function fmtAge(ms: number): string {
+    if (ms === 0) return '—';
+    const sec = Math.max(0, Math.floor((Date.now() - ms) / 1000));
+    if (sec < 60) return sec + 's ago';
+    return Math.floor(sec / 60) + 'm ago';
   }
 </script>
 
 <section>
-  <h2>Status</h2>
+  <header>
+    <h2>Status</h2>
+    <small class="loaded">refreshed {fmtAge(loadedAt)}</small>
+  </header>
 
   <div class="grid">
     <div class="card">
       <div class="row">
+        <span class="led" style="background: {ledColor(led)}"></span>
+        <span>Router state</span>
+        <span class="pill dim mono">{led}</span>
+      </div>
+      <small>composed from bubble-vpnd + bubble-netd by bubble-hwd</small>
+    </div>
+
+    <div class="card">
+      <div class="row">
         <span class="icon">{ICON.shield}</span>
         <span>Tunnel</span>
-        {#if wg?.up}
-          <span class="pill ok">up</span>
+        <span class="pill {tunnelPill().cls}">{tunnelPill().text}</span>
+      </div>
+      <small>
+        {#if vpn?.active_id}
+          {vpn.label} ({vpn.endpoint})
+        {:else if poolSize === 0}
+          no configs yet — import one on the VPN page
         {:else}
-          <span class="pill err">down</span>
+          {poolSize} config{poolSize === 1 ? '' : 's'} in pool, none active
+        {/if}
+      </small>
+    </div>
+
+    <div class="card">
+      <div class="row">
+        <span class="icon">{ICON.lock}</span>
+        <span>Firewall</span>
+        <span class="pill {signinPill(ns.signin).cls}">{signinPill(ns.signin).text}</span>
+      </div>
+      <small>
+        {#if ns.signin?.state === 'open'}
+          sign-in window: {ns.signin.remaining_sec}s remaining
+        {:else if ns.signin?.strict_mode}
+          strict mode — no captive-portal bypass allowed
+        {:else}
+          LAN→WAN gated by tunnel state
+        {/if}
+      </small>
+    </div>
+
+    <div class="card">
+      <div class="row">
+        <span class="icon">{ICON.wifi}</span>
+        <span>Captive portal</span>
+        <span class="pill {captivePill().cls}">{captivePill().text}</span>
+      </div>
+      <small>
+        {#if ns.captive?.captive}
+          {(ns.captive.portal_ips ?? []).join(', ') || 'unknown IP'}
+        {:else if ns.captive}
+          no portal intercepting traffic
+        {:else}
+          probe pending
+        {/if}
+      </small>
+    </div>
+
+    <div class="card">
+      <div class="row">
+        <span class="icon">{ICON.key}</span>
+        <span>Session</span>
+        {#if who?.authenticated}
+          <span class="pill ok">credential #{who.credential_id}</span>
+        {:else}
+          <span class="pill err">none</span>
         {/if}
       </div>
-      <small>{wg?.peer ?? 'no peer configured'}</small>
-    </div>
-
-    <div class="card">
-      <div class="row">
-        <span class="icon">{ICON.globe}</span>
-        <span>DNS</span>
-        {#if dns?.enforced}
-          <span class="pill ok">enforced</span>
+      <small>
+        {#if who?.authenticated}
+          expires in {fmtExpiry(who.expires_at)}
         {:else}
-          <span class="pill warn">leaky</span>
+          not signed in
         {/if}
-      </div>
-      <small>{dns?.provider ?? '—'} via {dns?.mode ?? '—'}</small>
-    </div>
-
-    <div class="card">
-      <div class="row">
-        <span class="icon">{ICON.router}</span>
-        <span>Device</span>
-      </div>
-      <small>{board?.model ?? '…'} ({board?.release.version ?? '—'})</small>
-    </div>
-
-    <div class="card">
-      <div class="row">
-        <span class="icon">{ICON.bolt}</span>
-        <span>Uptime</span>
-      </div>
-      <small>{info ? fmtUptime(info.uptime) : '…'}</small>
+      </small>
     </div>
   </div>
 </section>
 
 <style>
-  h2 { margin: 0 0 12px 0; font-size: 16px; font-weight: 600; }
+  header {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    margin-bottom: 12px;
+  }
+  h2 { margin: 0; font-size: 16px; font-weight: 600; }
+  .loaded { color: var(--fg-faint); font-size: 12px; }
+
   .grid {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
     gap: 8px;
   }
   .card {
@@ -104,4 +215,14 @@
   }
   .row > span:nth-child(2) { flex: 1; }
   small { color: var(--fg-dim); font-size: 12px; }
+  .pill.dim { color: var(--fg-faint); border-color: var(--border); }
+  .mono { font-family: var(--font-mono); }
+
+  .led {
+    display: inline-block;
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    box-shadow: 0 0 8px currentColor;
+  }
 </style>
