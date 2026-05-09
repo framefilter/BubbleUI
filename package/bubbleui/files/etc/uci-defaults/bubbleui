@@ -1,0 +1,69 @@
+#!/bin/sh
+# /etc/uci-defaults/bubbleui — runs once after the package is
+# installed (or on first boot when shipped in an image). Idempotent;
+# safe to re-run.
+#
+# Three jobs:
+#   1. Generate the self-signed UI cert.
+#   2. Open a port on the LAN-side firewall.
+#   3. Reload nginx + firewall so the changes take effect.
+#
+# We don't write /etc/config/bubbleui here — it's shipped as a
+# conffile, so opkg installs it directly with the package's defaults.
+
+set -e
+
+# 1. Self-signed cert with broad validity (DESIGN §6.6). px5g is
+# OpenWRT's tiny TLS toolchain and is preferred over openssl on
+# small-flash devices. The fallback path covers x86 builds where
+# px5g is sometimes excluded.
+mkdir -p /etc/bubble
+chmod 0700 /etc/bubble
+
+if [ ! -f /etc/bubble/ui.pem ] || [ ! -f /etc/bubble/ui.key ]; then
+	HOSTNAME=$(uci -q get bubbleui.ui.hostname || echo bubble.local)
+
+	if command -v px5g >/dev/null 2>&1; then
+		px5g selfsigned -type rsa -bits 2048 \
+			-keyout /etc/bubble/ui.key \
+			-out    /etc/bubble/ui.pem \
+			-days   28000 \
+			-subj   "/CN=${HOSTNAME}"
+	elif command -v openssl >/dev/null 2>&1; then
+		openssl req -x509 -newkey rsa:2048 -nodes \
+			-keyout /etc/bubble/ui.key \
+			-out    /etc/bubble/ui.pem \
+			-days   28000 \
+			-subj   "/CN=${HOSTNAME}"
+	else
+		echo "bubbleui: no TLS toolchain (px5g or openssl) found; UI cert not generated" >&2
+		exit 1
+	fi
+	chmod 0600 /etc/bubble/ui.key
+	chmod 0644 /etc/bubble/ui.pem
+fi
+
+# 2. LAN firewall: allow inbound 80/443 from the LAN zone so the
+# user can reach the UI without manually editing the firewall.
+# Idempotent — checks for our marker name first.
+if ! uci -q show firewall | grep -q "name='Allow-BubbleUI-LAN'"; then
+	uci -q batch <<-EOF
+		add firewall rule
+		set firewall.@rule[-1].name='Allow-BubbleUI-LAN'
+		set firewall.@rule[-1].src='lan'
+		set firewall.@rule[-1].proto='tcp'
+		set firewall.@rule[-1].dest_port='80 443'
+		set firewall.@rule[-1].target='ACCEPT'
+		commit firewall
+	EOF
+fi
+
+# 3. Tell nginx + firewall to pick up the new files. We use init.d
+# rather than fw4/nginx -s because those calls work both on a fresh
+# install and on a live system.
+[ -x /etc/init.d/nginx ]   && /etc/init.d/nginx   reload   2>/dev/null || true
+[ -x /etc/init.d/firewall ] && /etc/init.d/firewall reload 2>/dev/null || true
+
+# Returning 0 tells procd to delete this script after a successful
+# run, matching standard uci-defaults convention.
+exit 0

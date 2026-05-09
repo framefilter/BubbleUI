@@ -1,0 +1,47 @@
+# /etc/config/bubbleui — UCI configuration for BubbleUI.
+#
+# These are the defaults; the user can edit values via `uci set
+# bubbleui.server.<name>=<value>` or by hand. Daemons reload when this
+# file changes (see /etc/init.d/bubble-* service_triggers).
+
+config server 'server'
+	# bubble-authd
+	option listen          '127.0.0.1:8765'
+	option rp_id           'bubble.local'
+	option allow_set_time  '1'
+	option auth_db         '/etc/bubble/credentials.db'
+
+	# bubble-vpnd
+	option vpn_listen      '127.0.0.1:8766'
+	option vpn_db          '/etc/bubble/vpn.db'
+	option probe_timeout   '1500ms'
+	option probe_parallel  '16'
+
+	# bubble-netd
+	option net_listen       '127.0.0.1:8767'
+	option window_duration  '10m'
+	option captive_timeout  '3s'
+
+	# bubble-hwd
+	option hw_listen         '127.0.0.1:8768'
+	option compose_interval  '5s'
+	option auth_health_url   'http://127.0.0.1:8765/auth/health'
+	option vpn_status_url    'http://127.0.0.1:8766/vpn/status'
+	option net_signin_url    'http://127.0.0.1:8767/net/signin/status'
+	# Leave led_name empty for auto-detect via UCI (DESIGN §14) +
+	# /sys/class/leds probe. Override only when those don't pick the
+	# right LED on a given device.
+	option led_name          ''
+
+config ui 'ui'
+	# Hostname/SAN baked into the self-signed cert generated at first
+	# boot. Browsers will warn once until the user accepts the cert
+	# exception — see DESIGN §6.6.
+	option hostname  'bubble.local'
+	option cert      '/etc/bubble/ui.pem'
+	option key       '/etc/bubble/ui.key'
+
+	# Front-end origins permitted on state-changing requests against
+	# bubble-authd. Empty defaults to "no Origin check" — fine when
+	# running behind nginx on the same host.
+	list allowed_origin
