@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/framefilter/bubbleui/backend/internal/buttons"
+	"github.com/framefilter/bubbleui/backend/internal/composer"
 	"github.com/framefilter/bubbleui/backend/internal/hwapi"
 	"github.com/framefilter/bubbleui/backend/internal/led"
 )
@@ -34,10 +35,21 @@ Flags:
   -listen ADDR        HTTP listen address (default 127.0.0.1:8768)
   -led NAME           preferred /sys/class/leds entry (default: first found)
   -mock               force mock LED + buttons even if sysfs is available
+  -vpn-status URL     bubble-vpnd status URL for LED composition
+                      (default http://127.0.0.1:8766/vpn/status)
+  -net-signin URL     bubble-netd signin URL for LED composition
+                      (default http://127.0.0.1:8767/net/signin/status)
+  -compose-interval   how often to poll vpnd/netd (default 5s)
+  -no-compose         disable cross-daemon LED composition
   -h, --help          show this help
 
 Without -mock the daemon attempts to bind to /sys/class/leds and
 /dev/input/event* and falls back to mocks if those aren't usable.
+
+The composer polls bubble-vpnd and bubble-netd and resolves their
+state into the right led.State per DESIGN.md §13.5. It runs unless
+-no-compose is passed; when running, manual writes to /hw/led are
+overwritten on the next tick.
 `
 
 func main() {
@@ -49,14 +61,22 @@ func main() {
 
 func run() error {
 	var (
-		listen    string
-		ledName   string
-		forceMock bool
-		showHelp  bool
+		listen          string
+		ledName         string
+		forceMock       bool
+		vpnStatusURL    string
+		netSigninURL    string
+		composeInterval time.Duration
+		noCompose       bool
+		showHelp        bool
 	)
 	flag.StringVar(&listen, "listen", "127.0.0.1:8768", "HTTP listen address")
 	flag.StringVar(&ledName, "led", "", "preferred /sys/class/leds entry name")
 	flag.BoolVar(&forceMock, "mock", false, "force mock implementations")
+	flag.StringVar(&vpnStatusURL, "vpn-status", "http://127.0.0.1:8766/vpn/status", "bubble-vpnd status URL")
+	flag.StringVar(&netSigninURL, "net-signin", "http://127.0.0.1:8767/net/signin/status", "bubble-netd signin URL")
+	flag.DurationVar(&composeInterval, "compose-interval", 5*time.Second, "cross-daemon poll interval")
+	flag.BoolVar(&noCompose, "no-compose", false, "disable cross-daemon LED composition")
 	flag.BoolVar(&showHelp, "help", false, "show help")
 	flag.Usage = func() { fmt.Fprint(os.Stderr, usage) }
 	flag.Parse()
@@ -114,6 +134,24 @@ func run() error {
 	// Use api.Set so the API's tracked state stays in sync with reality.
 	_ = api.Set(led.StateBooting)
 
+	// Cross-daemon LED orchestration: polls bubble-vpnd and bubble-netd
+	// and pushes the composed state to api.Set. Runs in the background
+	// for the daemon's lifetime unless -no-compose was passed.
+	composeMode := "off"
+	if !noCompose {
+		comp := composer.New(composer.Config{
+			Source: composer.Source{
+				VPNStatusURL: vpnStatusURL,
+				NetSigninURL: netSigninURL,
+			},
+			Setter:   api,
+			Interval: composeInterval,
+			Logger:   logger,
+		})
+		go comp.Run(ctx)
+		composeMode = "on"
+	}
+
 	go func() {
 		<-ctx.Done()
 		_ = api.Set(led.StateOff)
@@ -125,7 +163,8 @@ func run() error {
 	}()
 
 	logger.Info("bubble-hwd listening",
-		"addr", listen, "led_mode", ledMode, "buttons_mode", btnMode)
+		"addr", listen, "led_mode", ledMode, "buttons_mode", btnMode,
+		"compose", composeMode, "compose_interval", composeInterval)
 	if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
