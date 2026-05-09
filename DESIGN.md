@@ -90,6 +90,7 @@ A simple, security-conscious web UI for OpenWRT travel routers.
 - Reusing `ubus`/`rpcd` means we inherit OpenWRT's existing auth model (sessions, ACL groups, audit logs) and don't ship a parallel privilege boundary.
 - The auth helper is the *only* component that talks to USB. Everything else stays declarative UCI calls.
 - A clean uhttpd → rpcd path lets us drop in mTLS or a future binary auth daemon without changing the SPA.
+- Hardware-touching daemons (`bubble-hwd`, the `wg-quick` Connector, the nftables Applier) consult **UCI / `/etc/board.json` first, sysfs second** — see §14. This is what lets one .ipk cover every Tier-2 vanilla-OpenWRT device without per-board code on our side.
 
 ## 5. Authentication
 
@@ -480,11 +481,29 @@ Anything else is denied. ACL files are versioned in this repo.
 
 ## 13. Hardware target
 
-**Reference device: GL.iNet GL-AXT1800 (Slate AX), running vanilla OpenWRT.**
+BubbleUI runs on **vanilla OpenWRT 23.05+** on any device that meets the
+resource floor in §13.3. We don't ship per-device builds; one `.ipk` per
+CPU architecture covers everything. Hardware diversity is handled by
+OpenWRT's UCI/board.json layer (see §14), not by us.
 
-Chosen because it's the cleanest VPN-capable travel router in its segment: vanilla OpenWRT support is mature (`qualcommax/ipq60xx` target), the USB 3.0 port is well-suited for an always-attached YubiKey, and the WiFi 6 dual-radio config supports simultaneous AP+STA on different bands without contention.
+Three tiers describe what "supported" means:
 
-### 13.1 Specs
+### 13.1 Support tiers
+
+| Tier | What it covers | What we promise |
+|---|---|---|
+| **1 — Tested** | The reference device (GL.iNet GL-AXT1800), plus any device the maintainer regularly carries. Exercised in CI integration tests and personally bench-tested. | Bugs are bugs; the wizard is expected to work end-to-end. |
+| **2 — Should work** | Any vanilla-OpenWRT-supported device that meets the §13.3 resource floor and ships in one of our cross-compile architecture targets. | Best-effort. The §14 UCI-driven hardware abstraction means it almost certainly works; bug reports welcome but not gating. |
+| **3 — Out of scope** | Below the resource floor; needs hardware we don't abstract (cellular modems, custom RGB controllers); not in OpenWRT's Table of Hardware. | Not supported. The .ipk may install but behavior is undefined. |
+
+### 13.2 Reference device — GL-AXT1800 (Slate AX)
+
+The maintainer's bench device and the only Tier-1-tested target today.
+Picked because it's the cleanest VPN-capable travel router in its
+segment: vanilla OpenWRT support is mature (`qualcommax/ipq60xx`
+target), the USB 3.0 port is well-suited for an always-attached
+YubiKey, and the WiFi 6 dual-radio config supports simultaneous AP+STA
+on different bands without contention.
 
 | | |
 |---|---|
@@ -498,7 +517,34 @@ Chosen because it's the cleanest VPN-capable travel router in its segment: vanil
 | LED | 1× multi-color (top) |
 | RTC | none — see §6.6 |
 
-### 13.2 Firmware base — vanilla OpenWRT only
+Other devices the maintainer might add to Tier 1 over time: Beryl AX
+(GL-MT3000), Marble (GL-MT6000), Brume 2 (GL-MT2500, no-WiFi VPN
+gateway). Each addition is a CI matrix entry plus benchwork; no code
+changes assumed.
+
+### 13.3 Resource floor (Tier 2 minimum)
+
+| | |
+|---|---|
+| Frontend bundle (HTML+JS+CSS+font) | < 400 KB target, ~85 KB realistic (current: 65 KB un-fonted) |
+| Each Go daemon, statically-linked stripped | 8-15 MB (current: `bubble-authd` 11 MB linux/arm64) |
+| Total BubbleUI install footprint | < 50 MB on flash (four Go daemons + frontend + configs) |
+| BubbleUI RAM at idle (all daemons) | < 50 MB |
+| **Device floor for Tier 2** | **128 MB flash, 256 MB RAM** |
+
+The floor excludes the cheapest travel routers (16/32 MB ath79
+boxes — Mango GL-MT300N etc.) where our stack simply doesn't fit. It
+includes essentially every modern OpenWRT-supported device: the
+Beryl/Slate/Marble/Brume/Spitz line from GL.iNet, x86 mini-PCs,
+RPi-with-USB-Ethernet builds, NanoPi R6S etc.
+
+The original draft assumed each daemon would land at 3-6 MB; in
+practice `go-webauthn` pulls in TPM/COSE/CBOR machinery that brings
+`bubble-authd` to ~11 MB statically-linked. Trading binary size for
+"drop the file on the router and run, no shared-library hunt" is the
+right deal at this hardware tier.
+
+### 13.4 Firmware base — vanilla OpenWRT only
 
 **Vanilla OpenWRT 23.05 or later. GL.iNet's stock firmware is explicitly out of scope and not supported.**
 
@@ -506,27 +552,30 @@ Reasons, not tradeoffs:
 
 - GL.iNet's firmware is a heavily customized OpenWRT fork with uneven update cadence. Vanilla gets reliable security updates from upstream.
 - We don't want to inherit GL.iNet's UI, their bundled apps, their telemetry, or their WAN-side cloud features.
-- Portability: anything we build on vanilla works on every other OpenWRT-supported device with comparable resources, which is good hygiene even though we only target one device today.
-- The AXT1800's hardware quirks (Mode switch, LED, button) become generic GPIOs we bind ourselves in `bubble-hwd`. Small upfront cost, total control.
+- Sticking to vanilla is what makes Tier 2 meaningful: any vanilla-OpenWRT-supported device speaks our UCI/board.json language.
 
-### 13.3 Resource budgets
+### 13.5 Cross-compile matrix
 
-| | |
-|---|---|
-| Frontend bundle (HTML+JS+CSS+font) | < 400 KB target, ~85 KB realistic (current: 65 KB un-fonted) |
-| Each Go daemon, statically-linked stripped | 8-15 MB (current: `bubble-authd` 11 MB linux/arm64) |
-| Total BubbleUI install footprint | < 50 MB on flash (three Go daemons + frontend + configs) |
-| BubbleUI RAM at idle (all daemons) | < 50 MB |
+The CI build pipeline targets the architectures that cover the
+overwhelming majority of modern OpenWRT-compatible devices in our
+resource floor:
 
-Leaves comfortable headroom for OpenWRT, dnsmasq, hostapd, wireguard tools, and trip configurations on a 128 MB / 512 MB device. The original draft assumed each daemon would land at 3-6 MB; in practice `go-webauthn` pulls in TPM/COSE/CBOR machinery that brings `bubble-authd` to ~11 MB statically-linked. Trading binary size for "drop the file on the router and run, no shared-library hunt" is the right deal at this hardware tier.
+| Target | OpenWRT name | Covers |
+|---|---|---|
+| `linux/arm64` | `aarch64_cortex-a53` | ipq60xx (AXT1800), mt7986a (Marble, Beryl AX), most modern qualcommax/mediatek |
+| `linux/arm` | `arm_cortex-a7_neon-vfpv4` | mt7621 (Slate Plus, older travel routers) |
+| `linux/amd64` | `x86_64` | x86 mini-PCs, Protectli, generic OpenWRT-on-PC builds |
 
-### 13.4 Radio plan
+A fourth (`mips_24kc` for legacy mt7621 / ar71xx) is a build-on-request
+add since those devices increasingly fail the resource floor anyway.
+
+### 13.6 Radio plan
 
 - **Travel SSID (AP):** 5 GHz default. Less congested in hotels, faster, supports more devices.
 - **Hotel uplink (STA):** 2.4 GHz default. Better penetration, more universally available.
 - User can swap in settings if a particular trip's hotel is 5 GHz only.
 
-### 13.5 LED behavior
+### 13.7 LED behavior
 
 | State | LED |
 |---|---|
@@ -537,6 +586,70 @@ Leaves comfortable headroom for OpenWRT, dnsmasq, hostapd, wireguard tools, and 
 | Tunnel down, kill switch active | slow red blink |
 | Hardware fault / YubiKey expected but missing | fast red blink |
 
-### 13.6 Portability
+The actual mapping from these abstract states to a particular device's
+LED hardware is handled by §14's hardware abstraction — `bubble-hwd`
+asks UCI which LED entries exist and what their colors are, then renders
+the state via brightness + blink triggers.
 
-Hardware-touching code (LED, GPIO, USB enumeration paths) lives in a single `bubble-hwd` adapter. Supporting another OpenWRT device is a matter of writing a new adapter, not rewriting the daemons. But the AXT1800 is the *only* device tested or supported in v1.0; everything else is best-effort and explicitly unsupported.
+## 14. Hardware abstraction strategy
+
+BubbleUI's daemons ask **UCI / `/etc/board.json` first, sysfs second,
+configured override third.** The intent is to get every Tier-2 device
+working without per-device driver code on our side.
+
+### 14.1 Why
+
+Argon, Alpha, and the other LuCI themes "support every OpenWRT device"
+because they don't actually do hardware abstraction — they sit on top
+of LuCI, which sits on top of UCI, which sits on top of OpenWRT's
+per-device DTS / board.json / kmod packaging. That's the whole trick.
+We adopt the same pattern, with our own SPA + auth stack on top.
+
+### 14.2 What our daemons consult
+
+| Concern | Source of truth |
+|---|---|
+| LED entries (which sysfs path is the status LED, what color, what triggers exist) | `uci show system` (LED sections) → `/sys/class/leds/<sysfs>/...` for the actual write |
+| Button mappings (which `/dev/input/event*` is "reset", which is the mode switch) | `uci show system` (button sections) + `/etc/rc.button/<name>` hotplug convention |
+| Network interfaces (which iface is WAN, which is LAN bridge) | `uci show network` |
+| Wireless radios (which `phy*` is 2.4 vs 5 GHz, max client count) | `uci show wireless` + `iw phy` |
+| Firewall zones | `uci show firewall` |
+| Device identity (model, board name, target architecture) | `ubus call system board` |
+
+For each, our daemons write through `uci` for persistent changes and
+through `ubus` for runtime queries — never poking sysfs/procfs paths
+directly when an OpenWRT abstraction exists.
+
+### 14.3 Fallback ladder
+
+For each piece of hardware our daemons need to bind:
+
+1. **UCI lookup** — does OpenWRT already declare this? If yes, use it.
+2. **Runtime probe** — scan `/sys/class/leds`, `/dev/input/event*`,
+   `iw dev`, etc. for what's actually present.
+3. **Configured override** — `/etc/bubble/hardware.json` lets the user
+   pin specific paths when neither of the above gets it right (e.g.,
+   weird out-of-tree LED on a community device).
+
+The override file is the escape hatch. Most Tier-2 devices never need
+it; documented for the long-tail cases.
+
+### 14.4 Quirks registry
+
+A small Go package (`internal/quirks`) maps known board strings (from
+`ubus call system board`) to known overrides. This is where
+device-specific knowledge accumulates — e.g., "the AXT1800's 'wlan'
+LED is actually the WAN-side activity light, not a status LED, so
+prefer the system LED entry" or "the Marble has no usable status LED,
+fall back to the GPIO behind the case."
+
+PRs to extend the quirks registry are how new devices opt into Tier 2
+"just works" status. No driver code required.
+
+### 14.5 What this commits us to
+
+- **Don't write our own hardware drivers** when OpenWRT already drives the hardware. We're an application, not a BSP.
+- **Don't fork per-device variants** of any binary. One `.ipk` per architecture, hardware diversity at config-time.
+- **Don't hide the UCI/ubus surface** from users who want to fall back to LuCI for niche tweaks. We're a focused web UI, not a replacement OS.
+
+

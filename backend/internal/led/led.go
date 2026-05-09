@@ -1,20 +1,23 @@
-// Package led abstracts the router's status LED. DESIGN.md §13.5 maps
+// Package led abstracts the router's status LED. DESIGN.md §13.7 maps
 // BubbleUI states to LED behaviors; this package owns that mapping.
 //
 // The Driver interface is small (Render(state) + Close()) so we can ship
 // multiple implementations:
 //
 //   - MockDriver:   for dev / tests, records the last state in memory.
-//   - MonoDriver:   single-channel LED, encodes state via blink patterns.
-//   - RGBDriver:    multi-channel LED, encodes state via color.
-//   - SysfsDriver:  drives /sys/class/leds/<name>/brightness on Linux.
+//   - SysfsDriver:  drives /sys/class/leds/<name>/{brightness,trigger}
+//     on Linux. Auto-detects mono vs RGB from sibling
+//     entry naming.
 //
-// The AXT1800's actual LED capability is one of mono / RGB; we'll pick
-// at startup once we have the hardware in front of us. Until then,
-// daemons consume the abstract State and the dev binary uses MockDriver.
+// SysfsDriver follows DESIGN.md §14's resolution ladder: it asks UCI
+// (`uci show system`) first to find the OpenWRT-declared status LED,
+// and only falls back to scanning /sys/class/leds when UCI doesn't
+// answer. That's what lets one binary cover every Tier-2 device
+// without per-board code. See uci.go.
 package led
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -158,10 +161,29 @@ type SysfsDriver struct {
 // at /sys/class/leds.
 var ErrNoSysfs = errors.New("led: /sys/class/leds has no usable entries")
 
-// NewSysfs scans /sys/class/leds and constructs a driver. Pass an
-// explicit name (e.g. "white:status") to bind to a specific LED;
-// otherwise the first found entry wins.
+// NewSysfs scans /sys/class/leds and constructs a driver.
+//
+// Resolution order, per DESIGN.md §14:
+//
+//  1. If preferredName is set, ask UCI: does OpenWRT declare an LED by
+//     this name (or section ID)? If yes, use the declared sysfs path.
+//  2. If preferredName is empty, ask UCI for the conventional status
+//     LED ("status" / "system" / "power").
+//  3. Fall back to scanning /sys/class/leds directly: explicit
+//     preferredName as a literal sysfs name first, then auto-detect
+//     mono vs RGB from color-prefixed siblings.
+//
+// On non-Linux dev hosts, NewSysfs returns ErrNoSysfs and the daemon
+// substitutes MockDriver.
 func NewSysfs(preferredName string) (*SysfsDriver, error) {
+	// Step 1+2: try UCI. We pass through to direct sysfs probing on
+	// any UCI-side error (no uci, timeout, no entries) — those aren't
+	// fatal, they just mean we can't take the shortcut.
+	resolved, err := ResolveUCIName(context.Background(), preferredName, nil)
+	if err == nil && resolved != "" {
+		preferredName = resolved
+	}
+
 	entries, err := os.ReadDir("/sys/class/leds")
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrNoSysfs, err)
