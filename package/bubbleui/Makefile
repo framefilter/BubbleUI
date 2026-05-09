@@ -1,20 +1,29 @@
 # BubbleUI — OpenWRT package definition.
 #
-# Build via the OpenWRT SDK:
+# We deliberately do NOT use golang-package.mk: BubbleUI's daemons are
+# CGO-free static binaries, and pinning to OpenWRT's per-release Go
+# toolchain wiring buys us nothing while making CI fragile across
+# 23.05 / 24.10 / SNAPSHOT. Instead, CI cross-compiles with the host
+# Go toolchain and points this Makefile at the resulting binaries
+# via $(BUBBLEUI_BIN). The SDK build is just an .ipk-packaging step.
 #
-#   ln -s $(pwd)/package/bubbleui ${SDK_PATH}/package/bubbleui
-#   cd ${SDK_PATH}
-#   make package/bubbleui/compile V=s
+# Build via the OpenWRT SDK (CI does this; manual steps mirror it):
 #
-# The package is "pure" in the §15 sense: it installs onto vanilla
-# OpenWRT 23.05+ without any image-level patches. See DESIGN.md §10.
+#   # Cross-compile the daemons + frontend ahead of time:
+#   (cd backend && GOOS=linux GOARCH=arm64 CGO_ENABLED=0 \
+#       go build -trimpath -ldflags='-s -w' \
+#       -o /tmp/bubbleui-bin/aarch64/ ./cmd/...)
+#   (cd frontend && pnpm install --frozen-lockfile && pnpm build)
 #
-# Source layout assumptions:
-#   - The repo's backend/ directory is the Go module
-#     (github.com/framefilter/bubbleui/backend).
-#   - The frontend dist (pre-built before the package build) lives at
-#     frontend/dist/ relative to the repo root. CI runs `pnpm build`
-#     before invoking the SDK; manual builds need to do the same.
+#   # Symlink and compile inside the SDK:
+#   ln -s $(pwd)/package/bubbleui ${SDK}/package/bubbleui
+#   cd ${SDK}
+#   make package/bubbleui/compile V=s \
+#       BUBBLEUI_SRC=/path/to/BubbleUI \
+#       BUBBLEUI_BIN=/tmp/bubbleui-bin/aarch64
+#
+# BUBBLEUI_SRC defaults to two dirs above this Makefile (typical
+# feeds.d/bubbleui/bubbleui layout). BUBBLEUI_BIN is required.
 
 include $(TOPDIR)/rules.mk
 
@@ -26,26 +35,10 @@ PKG_LICENSE:=MIT
 PKG_LICENSE_FILES:=LICENSE
 PKG_MAINTAINER:=framefilter
 
-PKG_BUILD_DEPENDS:=golang/host
-PKG_BUILD_PARALLEL:=1
-PKG_USE_MIPS16:=0
-
-# Path to the BubbleUI checkout. The SDK build sets this via
-# `make BUBBLEUI_SRC=/path/to/repo package/bubbleui/compile`. Defaults
-# to two dirs above this Makefile, which is where it'd live in a
-# typical `feeds.d/bubbleui/bubbleui` symlink.
 BUBBLEUI_SRC?=$(CURDIR)/../..
-
-GO_SRC_DIR:=$(BUBBLEUI_SRC)/backend
-GO_PKG:=github.com/framefilter/bubbleui/backend
-GO_PKG_BUILD_PKG:=\
-	$(GO_PKG)/cmd/bubble-authd \
-	$(GO_PKG)/cmd/bubble-vpnd \
-	$(GO_PKG)/cmd/bubble-netd \
-	$(GO_PKG)/cmd/bubble-hwd
+BUBBLEUI_BIN?=
 
 include $(INCLUDE_DIR)/package.mk
-include $(TOPDIR)/feeds/packages/lang/golang/golang-package.mk
 
 define Package/bubbleui
   SECTION:=net
@@ -53,8 +46,7 @@ define Package/bubbleui
   SUBMENU:=Web Servers/Proxies
   TITLE:=BubbleUI travel router admin UI
   URL:=https://github.com/framefilter/bubbleui
-  DEPENDS:=$(GO_ARCH_DEPENDS) \
-           +nginx-ssl \
+  DEPENDS:=+nginx-ssl \
            +nftables \
            +wireguard-tools \
            +dnsmasq-full \
@@ -83,23 +75,29 @@ define Package/bubbleui/conffiles
 /etc/bubble/ui.key
 endef
 
-# We don't fetch source — the SDK build copies $(GO_SRC_DIR) into
-# $(PKG_BUILD_DIR) instead of unpacking a tarball.
+# No source fetch / unpack / compile — the binaries are pre-built.
 define Build/Prepare
+	$(if $(BUBBLEUI_BIN),,$(error BUBBLEUI_BIN is required: point at the directory containing pre-built bubble-* binaries))
 	mkdir -p $(PKG_BUILD_DIR)
-	cp -a $(GO_SRC_DIR)/. $(PKG_BUILD_DIR)/
-	$(call GoMod/Go/Prepare)
+endef
+
+define Build/Compile
+	@echo "bubbleui: packaging pre-built binaries from $(BUBBLEUI_BIN)"
+	@for b in bubble-authd bubble-vpnd bubble-netd bubble-hwd; do \
+		[ -x $(BUBBLEUI_BIN)/$$b ] || { echo "missing $(BUBBLEUI_BIN)/$$b"; exit 1; }; \
+	done
+	@[ -d $(BUBBLEUI_SRC)/frontend/dist ] || { echo "missing $(BUBBLEUI_SRC)/frontend/dist (run pnpm build)"; exit 1; }
 endef
 
 define Package/bubbleui/install
-	# Daemons. golang-package.mk drops them in $(GO_PKG_BUILD_BIN_DIR).
+	# Daemons.
 	$(INSTALL_DIR) $(1)/usr/sbin
-	$(INSTALL_BIN) $(GO_PKG_BUILD_BIN_DIR)/bubble-authd $(1)/usr/sbin/bubble-authd
-	$(INSTALL_BIN) $(GO_PKG_BUILD_BIN_DIR)/bubble-vpnd  $(1)/usr/sbin/bubble-vpnd
-	$(INSTALL_BIN) $(GO_PKG_BUILD_BIN_DIR)/bubble-netd  $(1)/usr/sbin/bubble-netd
-	$(INSTALL_BIN) $(GO_PKG_BUILD_BIN_DIR)/bubble-hwd   $(1)/usr/sbin/bubble-hwd
+	$(INSTALL_BIN) $(BUBBLEUI_BIN)/bubble-authd $(1)/usr/sbin/bubble-authd
+	$(INSTALL_BIN) $(BUBBLEUI_BIN)/bubble-vpnd  $(1)/usr/sbin/bubble-vpnd
+	$(INSTALL_BIN) $(BUBBLEUI_BIN)/bubble-netd  $(1)/usr/sbin/bubble-netd
+	$(INSTALL_BIN) $(BUBBLEUI_BIN)/bubble-hwd   $(1)/usr/sbin/bubble-hwd
 
-	# Frontend (pre-built). $(BUBBLEUI_SRC)/frontend/dist must exist.
+	# Frontend (pre-built).
 	$(INSTALL_DIR) $(1)/usr/share/bubbleui
 	cp -a $(BUBBLEUI_SRC)/frontend/dist/. $(1)/usr/share/bubbleui/
 
@@ -119,17 +117,16 @@ define Package/bubbleui/install
 
 	# Reverse-proxy + TLS termination via nginx.
 	$(INSTALL_DIR) $(1)/etc/nginx/conf.d
-	$(INSTALL_DATA) ./files/etc/nginx/conf.d/bubbleui.conf $(1)/etc/nginx/conf.d/bubbleui.conf
+	$(INSTALL_DATA) ./files/etc/nginx/conf.d/bubbleui.conf      $(1)/etc/nginx/conf.d/bubbleui.conf
+	$(INSTALL_DATA) ./files/etc/nginx/conf.d/bubbleui.proxy.inc $(1)/etc/nginx/conf.d/bubbleui.proxy.inc
 
-	# State directory placeholder so postinst-time DB creation has a home.
+	# State directory placeholder.
 	$(INSTALL_DIR) $(1)/etc/bubble
 endef
 
 define Package/bubbleui/postinst
 #!/bin/sh
 [ -n "$${IPKG_INSTROOT}" ] && exit 0
-# uci-defaults will run on first boot; if we're installing onto a
-# live system we run it now too.
 [ -x /etc/uci-defaults/bubbleui ] && /etc/uci-defaults/bubbleui
 /etc/init.d/bubble-authd enable
 /etc/init.d/bubble-vpnd  enable
@@ -156,5 +153,4 @@ define Package/bubbleui/prerm
 exit 0
 endef
 
-$(eval $(call GoBinPackage,bubbleui))
 $(eval $(call BuildPackage,bubbleui))

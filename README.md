@@ -51,6 +51,32 @@ What's wired today (testable on a Linux dev box, no router needed):
 - Frontend SPA — first-boot wizard, login, real `/vpn`, `/wifi`, and
   Dashboard panes. Each wired against the corresponding daemon.
 
+## Install (on a router)
+
+The shipping path is one OpenWRT `.ipk` per architecture, installed
+on top of vanilla OpenWRT 23.05+. See [`DESIGN.md` §10](./DESIGN.md#10-build--install)
+for the full rationale; the short version is:
+
+```sh
+# On the router:
+opkg update
+opkg install /tmp/bubbleui_<arch>.ipk
+```
+
+The package pulls `nginx-ssl`, `nftables`, `wireguard-tools`,
+`dnsmasq-full`, `https-dns-proxy`, `yubikey-personalization`,
+`px5g-mbedtls`, and `ca-bundle`. First-boot wiring (self-signed UI
+cert, LAN firewall rule for 80/443, procd-supervised daemons) runs
+automatically via `/etc/uci-defaults/bubbleui`.
+
+Browse to `https://<router-ip>/`, accept the self-signed cert
+exception, and run through the [§6.7 wizard](./DESIGN.md#67-first-boot-wizard).
+
+`.ipk` artifacts are produced by the
+[`package`](./.github/workflows/package.yml) workflow — currently
+on tag pushes and on-demand. Pre-built downloads will live on the
+GitHub Releases page once we tag a v0.1.
+
 ## Quick start (dev)
 
 ```sh
@@ -67,7 +93,7 @@ If you'd rather run pieces individually:
 
 ```sh
 cd backend
-go test ./...                                      # 18 packages
+go test ./...                                      # 19 packages
 go run ./cmd/bubble-authd -mock provision          # one-off CLI
 go run ./cmd/bubble-authd -mock serve -insecure -rp-id localhost
 go run ./cmd/bubble-vpnd
@@ -87,8 +113,11 @@ pnpm dev
 ├── README.md                — this
 ├── frontend/                — Svelte 5 + Vite SPA (see frontend/README.md)
 ├── backend/                 — Go module: four daemons + tests (see backend/README.md)
+├── package/bubbleui/        — OpenWRT .ipk skeleton (Makefile, init.d, UCI, nginx)
 ├── scripts/dev.sh           — multi-daemon dev launcher
-├── .github/workflows/ci.yml — push CI: tests, vet, gofmt, svelte-check, build
+├── .github/workflows/
+│   ├── ci.yml               — push CI: tests, vet, gofmt, svelte-check, build
+│   └── package.yml          — tagged-release CI: build .ipk per arch
 └── .claude/                 — SessionStart hook for cloud dev sessions
 ```
 

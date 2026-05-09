@@ -448,9 +448,69 @@ Anything else is denied. ACL files are versioned in this repo.
 
 ## 10. Build & install
 
-- Frontend: `pnpm build` produces `dist/` with hashed assets.
-- Package: standard OpenWRT `Makefile` builds `bubbleui_<ver>_all.ipk`. Install via `opkg install`.
-- **Hardware:** GL-AXT1800 (Slate AX) running **vanilla OpenWRT 23.05+**. GL.iNet's stock firmware is explicitly out of scope. See §13.
+### 10.1 Distribution model — pure `.ipk`
+
+BubbleUI ships as a single OpenWRT package (`.ipk`) per target
+architecture. The user comes in with a working vanilla OpenWRT 23.05+
+install (which they did themselves via the standard `sysupgrade`
+flow), copies the right `.ipk` to the device, and runs:
+
+```sh
+opkg install /tmp/bubbleui_<arch>.ipk
+```
+
+That's the whole install. Post-install, the package's
+`/etc/uci-defaults/bubbleui` runs once on first boot to:
+
+- generate the self-signed UI cert (DESIGN §6.6 — broad-validity so
+  wrong-time-on-boot doesn't break the UI);
+- open TCP 80/443 in the LAN firewall zone via a named UCI rule
+  (idempotent on re-run);
+- enable + start the four daemons via procd.
+
+The user opens `https://<router-ip>/` in a browser, accepts the
+self-signed cert exception once, and lands on the §6.7 wizard.
+
+### 10.2 What the package installs
+
+| Path | Contents |
+|---|---|
+| `/usr/sbin/bubble-{authd,vpnd,netd,hwd}` | Cross-compiled static Go daemons (one per arch). |
+| `/usr/share/bubbleui/` | Pre-built SPA dist (HTML+JS+CSS+font), served by nginx. |
+| `/etc/init.d/bubble-*` | procd init scripts; respawn on crash, reload on UCI change. |
+| `/etc/config/bubbleui` | UCI defaults read by every daemon at startup. |
+| `/etc/uci-defaults/bubbleui` | First-boot one-shot (see §10.1). Deletes itself after success. |
+| `/etc/nginx/conf.d/bubbleui.conf` | Reverse proxy + TLS termination. |
+
+State directories (`/etc/bubble/credentials.db`, `/etc/bubble/vpn.db`,
+the cert pair) are listed as `conffiles` so `opkg upgrade` preserves
+them across updates.
+
+### 10.3 Build chain
+
+| Step | Where it runs |
+|---|---|
+| 1. Build the frontend (`pnpm build → frontend/dist/`) | GitHub Actions `package` workflow |
+| 2. Cross-compile each daemon for the target Go arch | Same workflow, host Go toolchain (`CGO_ENABLED=0`) |
+| 3. Fetch the OpenWRT SDK for the target | Same workflow |
+| 4. Symlink `package/bubbleui` into the SDK and run `make package/bubbleui/compile` with `BUBBLEUI_SRC` + `BUBBLEUI_BIN` pointing at the pre-built artifacts | Same workflow |
+| 5. Upload the resulting `.ipk` as a build artifact (later: as a GitHub release asset on tag pushes) | Same workflow |
+
+The package's Makefile deliberately bypasses `golang-package.mk` —
+since we ship CGO-free static binaries, we don't need OpenWRT's Go
+toolchain coupling. CI builds binaries directly with the host Go;
+the SDK build is just an .ipk-packaging step. This keeps CI tractable
+across OpenWRT releases (23.05 / 24.10 / SNAPSHOT) without per-version
+fixups.
+
+### 10.4 Pre-built images
+
+Reserved for Tier-1 hardware only, opt-in per device, and not in
+v1.0 scope. See §13 — the project boundary is "package on top of
+OpenWRT," not "OpenWRT distribution." If carrying around a
+particular device gets annoying enough, we'd build an ImageBuilder
+profile that bakes the .ipk into a flashable firmware image, but
+that decision is per-device and per-need.
 
 ## 11. Open questions
 

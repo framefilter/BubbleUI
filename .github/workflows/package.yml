@@ -1,0 +1,183 @@
+name: package
+
+# Builds bubbleui_<arch>.ipk for each supported OpenWRT architecture.
+#
+# Triggered manually (workflow_dispatch) and on tag pushes — we don't
+# spin up the OpenWRT SDK on every commit, that's expensive and the
+# .ipk only matters at release time. The regular `ci` workflow stays
+# fast for everyday pushes.
+#
+# Outputs are uploaded as artifacts attached to the workflow run; the
+# release.yml workflow (later) will promote tagged builds to actual
+# GitHub releases.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      openwrt_version:
+        description: 'OpenWRT release to build SDK against'
+        required: false
+        default: '23.05.5'
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  OPENWRT_VERSION: ${{ github.event.inputs.openwrt_version || '23.05.5' }}
+
+concurrency:
+  group: package-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ipk:
+    name: ipk (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # AXT1800, Beryl AX, Marble: aarch64
+          - target: qualcommax-ipq60xx
+            goos: linux
+            goarch: arm64
+            arch_label: aarch64_cortex-a53
+            sdk_url_path: targets/qualcommax/ipq60xx
+          # mt7621 still very common on travel routers (older Slate, Brume 2)
+          - target: ramips-mt7621
+            goos: linux
+            goarch: mipsle
+            arch_label: mipsel_24kc
+            sdk_url_path: targets/ramips/mt7621
+            go_env: 'GOMIPS=softfloat'
+          # x86_64 generic — Protectli, mini-PCs, OpenWRT-on-VM
+          - target: x86-64
+            goos: linux
+            goarch: amd64
+            arch_label: x86_64
+            sdk_url_path: targets/x86/64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache-dependency-path: backend/go.sum
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      - name: Cross-compile daemons
+        working-directory: backend
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
+        run: |
+          mkdir -p ${{ github.workspace }}/bubbleui-bin
+          # Per-target Go env (e.g. GOMIPS=softfloat for ramips). Each
+          # matrix entry's go_env is a single space-separated KEY=VALUE
+          # list and we eval-export it before building.
+          ${{ matrix.go_env }} go build -trimpath -ldflags='-s -w' \
+            -o ${{ github.workspace }}/bubbleui-bin/ \
+            ./cmd/...
+          ls -la ${{ github.workspace }}/bubbleui-bin
+
+      - name: Fetch OpenWRT SDK
+        id: sdk
+        run: |
+          set -e
+          BASE="https://downloads.openwrt.org/releases/${OPENWRT_VERSION}/${{ matrix.sdk_url_path }}"
+          # The SDK tarball name is <openwrt-sdk-VERSION-TARGET-...>.tar.{xz,zst}.
+          # OpenWRT moved from xz to zst around 24.10; 23.05 still ships xz.
+          # We grep the directory listing rather than guess the exact suffix.
+          INDEX=$(curl -fsSL "$BASE/")
+          FILE=$(printf '%s' "$INDEX" | grep -oE 'openwrt-sdk-[^"]+\.tar\.(xz|zst)' | head -n1)
+          if [ -z "$FILE" ]; then
+            echo "::error::could not find SDK tarball at $BASE"
+            exit 1
+          fi
+          echo "Downloading $BASE/$FILE"
+          curl -fsSLO "$BASE/$FILE"
+
+          mkdir -p "$HOME/sdk"
+          case "$FILE" in
+            *.xz)  tar -xJf "$FILE" --strip-components=1 -C "$HOME/sdk" ;;
+            *.zst) tar --use-compress-program=unzstd -xf "$FILE" --strip-components=1 -C "$HOME/sdk" ;;
+          esac
+          echo "sdk_dir=$HOME/sdk" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare SDK feeds
+        env:
+          SDK: ${{ steps.sdk.outputs.sdk_dir }}
+        run: |
+          set -e
+          cd "$SDK"
+          cp feeds.conf.default feeds.conf
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          # bubbleui doesn't depend on the golang feed (we ship pre-
+          # built static binaries) but install it anyway in case the
+          # base image build wants it.
+
+      - name: Symlink bubbleui into SDK package tree
+        env:
+          SDK: ${{ steps.sdk.outputs.sdk_dir }}
+        run: |
+          ln -sf "${{ github.workspace }}/package/bubbleui" "$SDK/package/bubbleui"
+
+      - name: Build .ipk
+        env:
+          SDK: ${{ steps.sdk.outputs.sdk_dir }}
+        run: |
+          set -e
+          cd "$SDK"
+          # defconfig sets up the .config from feeds.
+          make defconfig
+          # Make sure bubbleui is selected as a module.
+          echo "CONFIG_PACKAGE_bubbleui=m" >> .config
+          make defconfig
+          # Build it. V=s for verbose so failures are visible.
+          make package/bubbleui/compile V=s -j$(nproc) \
+            BUBBLEUI_SRC=${{ github.workspace }} \
+            BUBBLEUI_BIN=${{ github.workspace }}/bubbleui-bin
+
+      - name: Locate and stage .ipk
+        id: locate
+        env:
+          SDK: ${{ steps.sdk.outputs.sdk_dir }}
+        run: |
+          set -e
+          IPK=$(find "$SDK/bin/packages" -name 'bubbleui_*.ipk' -print -quit)
+          if [ -z "$IPK" ]; then
+            echo "::error::No bubbleui .ipk produced. Build artifacts:"
+            find "$SDK/bin/packages" -type f | head -30
+            exit 1
+          fi
+          echo "Built: $IPK"
+          mkdir -p ${{ github.workspace }}/dist
+          cp "$IPK" ${{ github.workspace }}/dist/
+          ls -la ${{ github.workspace }}/dist/
+          echo "ipk_path=${{ github.workspace }}/dist/$(basename "$IPK")" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bubbleui-${{ matrix.arch_label }}
+          path: ${{ steps.locate.outputs.ipk_path }}
+          if-no-files-found: error
+          retention-days: 30
