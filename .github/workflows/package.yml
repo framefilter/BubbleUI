@@ -19,11 +19,15 @@ on:
       openwrt_version:
         description: 'OpenWRT release to build SDK against'
         required: false
-        default: '23.05.5'
+        default: '24.10.6'
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-  OPENWRT_VERSION: ${{ github.event.inputs.openwrt_version || '23.05.5' }}
+  # Track 24.10 — current stable line, AXT1800 territory. 23.05 still
+  # works in principle but the qualcommax target was reorganized in
+  # 24.x so SDK paths differ; we'd need per-version path tables to
+  # cover both. 25.x snapshots are deliberately out of scope.
+  OPENWRT_VERSION: ${{ github.event.inputs.openwrt_version || '24.10.6' }}
 
 concurrency:
   group: package-${{ github.ref }}
@@ -37,25 +41,29 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # AXT1800, Beryl AX, Marble: aarch64
-          - target: qualcommax-ipq60xx
+          # AXT1800, Beryl AX, etc.: aarch64_cortex-a53. In 24.10 the
+          # qualcommax target absorbed the old standalone ipq807x;
+          # qualcommax/ipq807x is the canonical 24.10 path for this
+          # arch. (qualcommax/ipq60xx — where the AXT1800 strictly
+          # belongs — is still snapshot-only, but the .ipk arch label
+          # matches so the package is install-compatible.)
+          - target: qualcommax-ipq807x
             goos: linux
             goarch: arm64
             arch_label: aarch64_cortex-a53
-            sdk_url_path: targets/qualcommax/ipq60xx
-          # mt7621 still very common on travel routers (older Slate, Brume 2)
-          - target: ramips-mt7621
-            goos: linux
-            goarch: mipsle
-            arch_label: mipsel_24kc
-            sdk_url_path: targets/ramips/mt7621
-            go_env: 'GOMIPS=softfloat'
-          # x86_64 generic — Protectli, mini-PCs, OpenWRT-on-VM
+            sdk_url_path: targets/qualcommax/ipq807x
+          # x86_64 generic — Protectli, mini-PCs, OpenWRT-on-VM.
           - target: x86-64
             goos: linux
             goarch: amd64
             arch_label: x86_64
             sdk_url_path: targets/x86/64
+          # NOTE: no mipsle/mt7621 build. modernc.org/sqlite (and its
+          # modernc.org/libc dependency) has no Go files for GOARCH=
+          # mips/mipsle, so the CGO-free build chain we rely on can't
+          # target those SoCs. mt7621 routers — common in older travel
+          # routers — are out of scope until we either ship a CGO+musl
+          # pipeline or replace SQLite with file-backed storage.
 
     steps:
       - uses: actions/checkout@v4
@@ -89,10 +97,7 @@ jobs:
           CGO_ENABLED: '0'
         run: |
           mkdir -p ${{ github.workspace }}/bubbleui-bin
-          # Per-target Go env (e.g. GOMIPS=softfloat for ramips). Each
-          # matrix entry's go_env is a single space-separated KEY=VALUE
-          # list and we eval-export it before building.
-          ${{ matrix.go_env }} go build -trimpath -ldflags='-s -w' \
+          go build -trimpath -ldflags='-s -w' \
             -o ${{ github.workspace }}/bubbleui-bin/ \
             ./cmd/...
           ls -la ${{ github.workspace }}/bubbleui-bin
