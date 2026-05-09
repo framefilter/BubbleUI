@@ -85,6 +85,18 @@ export const setupStatus = () =>
 
 export const yubikeyLogin = () => request<LoginOk>('POST', '/auth/yubikey/login');
 
+export interface YubiKeyProvisionOk {
+  credential_id: number;
+  recovery_code: string;
+  not_programmed: boolean;
+  // Only present when not_programmed is true:
+  secret_hex?: string;
+  program_hint?: string;
+}
+
+export const yubikeyProvision = () =>
+  request<YubiKeyProvisionOk>('POST', '/auth/yubikey/provision', {});
+
 // --- recovery ---
 
 export const recover = (code: string) =>
@@ -100,8 +112,15 @@ export const timeSync = (now: number, force = false) =>
 export const webauthnRegisterBegin = () =>
   request<WebAuthnBegin>('POST', '/auth/webauthn/register/begin', {});
 
+export interface WebAuthnRegisterFinishOk {
+  credential_id: number;
+  // Returned only when this is the first credential on the device.
+  // Display once and never store.
+  recovery_code?: string;
+}
+
 export const webauthnRegisterFinish = (handle: string, response: unknown, label?: string) =>
-  request<{ credential_id: number }>('POST', '/auth/webauthn/register/finish', {
+  request<WebAuthnRegisterFinishOk>('POST', '/auth/webauthn/register/finish', {
     handle,
     response,
     label,

@@ -42,6 +42,7 @@ func newRig(t *testing.T) *testRig {
 
 	mock := yubikey.NewMock()
 	a := auth.New(s, mock)
+	a.Programmer = mock // wizard provision flow uses the same mock instance
 
 	// Every rig gets a WebAuthn engine — the new endpoints assume one is
 	// configured, and crypto-free tests still need it to route correctly.
@@ -91,8 +92,9 @@ func (rig *testRig) provisionAndProgram(t *testing.T) (recoveryCode string) {
 	if err != nil {
 		t.Fatalf("ProvisionYubiKey: %v", err)
 	}
-	rig.mock.Program(yubikey.Slot2, res.Secret)
-	rig.mock.Plug()
+	if err := rig.mock.Program(context.Background(), yubikey.Slot2, res.Secret); err != nil {
+		t.Fatalf("Program: %v", err)
+	}
 	return res.RecoveryCode
 }
 
@@ -153,7 +155,7 @@ func TestYubiKeyLoginRejectsWrongKey(t *testing.T) {
 	rig := newRig(t)
 	rig.provisionAndProgram(t)
 	// Reprogram with a wrong secret.
-	rig.mock.Program(yubikey.Slot2, []byte("0123456789abcdefghij"))
+	_ = rig.mock.Program(context.Background(), yubikey.Slot2, []byte("0123456789abcdefghij"))
 
 	c := rig.client(t)
 	resp, err := c.Post(rig.server.URL+"/auth/yubikey/login", "", nil)
@@ -454,6 +456,83 @@ func TestOriginCheckBlocksDisallowed(t *testing.T) {
 	defer resp2.Body.Close()
 	if resp2.StatusCode == http.StatusForbidden {
 		t.Fatalf("allowed origin got 403")
+	}
+}
+
+func TestYubiKeyProvisionHappyPath(t *testing.T) {
+	rig := newRig(t)
+	c := rig.client(t)
+
+	resp, err := c.Post(rig.server.URL+"/auth/yubikey/provision", "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	body := decodeJSON(t, resp.Body)
+	if body["recovery_code"] == nil || body["recovery_code"] == "" {
+		t.Fatalf("missing recovery_code: %v", body)
+	}
+	if body["not_programmed"] != false {
+		t.Fatalf("expected not_programmed=false (mock programmer ran), got %v", body)
+	}
+
+	// After provision, login should now succeed because the mock got
+	// programmed with the secret, and the mock acts as both Oracle and Programmer.
+	loginResp, err := c.Post(rig.server.URL+"/auth/yubikey/login", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer loginResp.Body.Close()
+	if loginResp.StatusCode != http.StatusOK {
+		t.Fatalf("post-provision login status = %d, want 200", loginResp.StatusCode)
+	}
+}
+
+func TestYubiKeyProvisionRejectedAfterCredentialExists(t *testing.T) {
+	rig := newRig(t)
+	rig.provisionAndProgram(t) // writes a credential
+
+	c := rig.client(t)
+	resp, err := c.Post(rig.server.URL+"/auth/yubikey/provision", "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d, want 409", resp.StatusCode)
+	}
+}
+
+func TestYubiKeyProvisionWithoutProgrammerReportsManual(t *testing.T) {
+	// Build a rig but null out the Programmer to simulate a daemon
+	// running on a host without ykman.
+	s, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "creds.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	mock := yubikey.NewMock()
+	a := auth.New(s, mock)
+	// Programmer is intentionally nil here.
+	mgr, _ := session.NewManager(context.Background(), s.DB())
+	srv := New(Config{Auth: a, Sessions: mgr, Insecure: true})
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	resp, err := http.Post(ts.URL+"/auth/yubikey/provision", "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body := decodeJSON(t, resp.Body)
+	if body["not_programmed"] != true {
+		t.Fatalf("expected not_programmed=true, got %v", body)
+	}
+	if body["secret_hex"] == nil || body["secret_hex"] == "" {
+		t.Fatalf("expected secret_hex when not programmed, got %v", body)
 	}
 }
 

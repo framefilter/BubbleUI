@@ -19,8 +19,9 @@ func TestMockNotPresent(t *testing.T) {
 func TestMockChallengeRoundtrip(t *testing.T) {
 	m := NewMock()
 	secret := bytes.Repeat([]byte{0x42}, 20)
-	m.Program(Slot2, secret)
-	m.Plug()
+	if err := m.Program(context.Background(), Slot2, secret); err != nil {
+		t.Fatal(err)
+	}
 
 	ctx := context.Background()
 	resp, err := m.Challenge(ctx, Slot2, []byte("hello"))

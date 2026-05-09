@@ -6,7 +6,7 @@
   import { ICON } from './lib/icons';
 
   import Login from './routes/Login.svelte';
-  import SetupNeeded from './routes/SetupNeeded.svelte';
+  import Wizard from './routes/Wizard.svelte';
   import Dashboard from './routes/Dashboard.svelte';
   import Wifi from './routes/Wifi.svelte';
   import Vpn from './routes/Vpn.svelte';
@@ -45,7 +45,7 @@
 {#if s.authenticated === undefined}
   <div class="boot"><span class="icon spin">{ICON.refresh}</span> connecting…</div>
 {:else if s.setupNeeded}
-  <SetupNeeded />
+  <Wizard />
 {:else if !s.authenticated}
   <Login />
 {:else}

@@ -3,6 +3,7 @@
 //
 // Routing surface (all paths return JSON):
 //
+//	POST /auth/yubikey/provision            — first-boot wizard: program slot 2
 //	POST /auth/yubikey/login                — run §5.3 YubiKey login
 //	POST /auth/webauthn/register/begin      — start a WebAuthn registration
 //	POST /auth/webauthn/register/finish     — finish registration, persist
@@ -24,6 +25,7 @@
 package httpapi
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -101,6 +103,7 @@ func (s *Server) handler() http.Handler {
 }
 
 func (s *Server) routes() {
+	s.mux.HandleFunc("POST /auth/yubikey/provision", s.handleYubiKeyProvision)
 	s.mux.HandleFunc("POST /auth/yubikey/login", s.handleYubiKeyLogin)
 	s.mux.HandleFunc("POST /auth/webauthn/register/begin", s.handleWebAuthnRegisterBegin)
 	s.mux.HandleFunc("POST /auth/webauthn/register/finish", s.handleWebAuthnRegisterFinish)
@@ -114,6 +117,43 @@ func (s *Server) routes() {
 }
 
 // --- handlers ---
+
+// handleYubiKeyProvision is the wizard's "program this YubiKey on the
+// router USB" endpoint. Bootstrap-only: rejects with 409 if any
+// credential is already registered, so it can never be used to overwrite
+// an existing setup. Returns the recovery code, the slot-2 secret hex
+// (in case ykman programming fails and the user has to copy-paste a
+// command), and a flag indicating whether ykman ran successfully.
+func (s *Server) handleYubiKeyProvision(w http.ResponseWriter, r *http.Request) {
+	has, err := s.cfg.Auth.HasAnyCredential(r.Context())
+	if err != nil {
+		s.logger.Error("HasAnyCredential", "err", err)
+		writeError(w, http.StatusInternalServerError, "internal")
+		return
+	}
+	if has {
+		writeError(w, http.StatusConflict, "device is already provisioned; use /auth/recover to reset")
+		return
+	}
+	res, err := s.cfg.Auth.ProvisionYubiKeyAndProgram(r.Context(), "")
+	if err != nil {
+		s.logger.Error("provision yubikey", "err", err)
+		writeError(w, http.StatusInternalServerError, "provision failed")
+		return
+	}
+	body := map[string]any{
+		"credential_id":  res.CredentialID,
+		"recovery_code":  res.RecoveryCode,
+		"not_programmed": res.NotProgrammed,
+	}
+	if res.NotProgrammed {
+		// Surface the secret hex only when the daemon couldn't program
+		// the key automatically — the user needs it to run ykman manually.
+		body["secret_hex"] = hexEncode(res.Secret)
+		body["program_hint"] = res.ProgramHint
+	}
+	writeJSON(w, http.StatusOK, body)
+}
 
 func (s *Server) handleYubiKeyLogin(w http.ResponseWriter, r *http.Request) {
 	credID, err := s.cfg.Auth.LoginYubiKey(r.Context())
@@ -175,12 +215,18 @@ func (s *Server) handleWebAuthnRegisterFinish(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusBadRequest, "handle and response required")
 		return
 	}
-	id, err := s.cfg.Auth.FinishRegisterWebAuthn(r.Context(), req.Label, req.Handle, req.Response)
+	reg, err := s.cfg.Auth.FinishRegisterWebAuthn(r.Context(), req.Label, req.Handle, req.Response)
 	if err != nil {
 		writeError(w, http.StatusUnauthorized, "rejected")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"credential_id": id})
+	body := map[string]any{"credential_id": reg.CredentialID}
+	if reg.RecoveryCode != "" {
+		// First credential on this device — surface the recovery code
+		// once. Caller MUST display this to the user and never store it.
+		body["recovery_code"] = reg.RecoveryCode
+	}
+	writeJSON(w, http.StatusOK, body)
 }
 
 func (s *Server) handleWebAuthnLoginBegin(w http.ResponseWriter, r *http.Request) {
@@ -491,6 +537,8 @@ func writeJSON(w http.ResponseWriter, code int, body any) {
 func writeError(w http.ResponseWriter, code int, msg string) {
 	writeJSON(w, code, map[string]any{"error": msg})
 }
+
+func hexEncode(b []byte) string { return hex.EncodeToString(b) }
 
 // Ensure compile-time that *Server satisfies http.Handler.
 var _ http.Handler = (*Server)(nil)

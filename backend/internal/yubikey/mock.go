@@ -23,17 +23,8 @@ func NewMock() *Mock {
 	return &Mock{slots: make(map[Slot][]byte)}
 }
 
-// Program writes a slot secret. Mirrors what `ykman otp chalresp <slot> <hex>`
-// would do on real hardware.
-func (m *Mock) Program(slot Slot, secret []byte) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	cp := make([]byte, len(secret))
-	copy(cp, secret)
-	m.slots[slot] = cp
-}
-
-// Plug marks a virtual key as attached. Unplug removes it.
+// Plug marks a virtual key as attached. Unplug removes it. Program() (the
+// Programmer interface implementation, below) implicitly plugs in.
 func (m *Mock) Plug()   { m.mu.Lock(); m.online = true; m.mu.Unlock() }
 func (m *Mock) Unplug() { m.mu.Lock(); m.online = false; m.mu.Unlock() }
 
@@ -58,4 +49,21 @@ func (m *Mock) Present(_ context.Context) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.online
+}
+
+// Program implements Programmer by writing the secret into the named slot
+// and marking the mock as plugged in (programming a real key requires a
+// connected device, so the post-condition matches reality). Tests that
+// want "programmed but disconnected" should call Unplug() afterward.
+func (m *Mock) Program(_ context.Context, slot Slot, secret []byte) error {
+	if slot != Slot1 && slot != Slot2 {
+		return errors.New("yubikey: invalid slot (mock)")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cp := make([]byte, len(secret))
+	copy(cp, secret)
+	m.slots[slot] = cp
+	m.online = true
+	return nil
 }

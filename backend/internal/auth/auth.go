@@ -44,10 +44,11 @@ var (
 // Authenticator wires the persistence + crypto + yubikey + webauthn
 // adapters together. One instance per running daemon.
 type Authenticator struct {
-	Store    *store.Store
-	Yubi     yubikey.Oracle
-	WebAuthn *webauthn.Engine       // optional; nil disables WebAuthn flows
-	NewKey   func() ([]byte, error) // override in tests; defaults to crypto/rand
+	Store      *store.Store
+	Yubi       yubikey.Oracle
+	Programmer yubikey.Programmer     // optional; required for ProvisionYubiKeyAndProgram
+	WebAuthn   *webauthn.Engine       // optional; nil disables WebAuthn flows
+	NewKey     func() ([]byte, error) // override in tests; defaults to crypto/rand
 }
 
 // New returns an Authenticator with crypto/rand-backed key generation
@@ -125,6 +126,50 @@ func (a *Authenticator) ProvisionYubiKey(ctx context.Context, label string) (*Pr
 	}
 
 	return &ProvisionResult{CredentialID: id, RecoveryCode: code, Secret: S}, nil
+}
+
+// ProvisionYubiKeyAndProgram runs the full wizard provisioning step: it
+// generates the secret, persists the wrapped credential and recovery
+// code, then programs the secret into slot 2 of the attached YubiKey via
+// the configured Programmer. The recovery code is the only return value
+// the caller should ever display — Secret stays on the device.
+//
+// Programmer-failure semantics:
+//   - if Programmer is nil → returns the persisted result with NotProgrammed=true
+//     so the wizard can fall back to a copy-pasteable ykman command.
+//   - if Programmer returns ErrUnsupported (no ykman on PATH) → same as above.
+//   - if Programmer returns any other error → the credential row is rolled
+//     back so the user can retry without colliding state.
+type ProvisionAndProgramResult struct {
+	*ProvisionResult
+	NotProgrammed bool   // true if the Programmer wasn't run / couldn't run
+	ProgramHint   string // guidance to surface to the user when NotProgrammed
+}
+
+func (a *Authenticator) ProvisionYubiKeyAndProgram(ctx context.Context, label string) (*ProvisionAndProgramResult, error) {
+	res, err := a.ProvisionYubiKey(ctx, label)
+	if err != nil {
+		return nil, err
+	}
+	out := &ProvisionAndProgramResult{ProvisionResult: res}
+
+	if a.Programmer == nil {
+		out.NotProgrammed = true
+		out.ProgramHint = "no programmer configured; run ykman manually with the secret printed by the CLI"
+		return out, nil
+	}
+	if err := a.Programmer.Program(ctx, yubikey.Slot2, res.Secret); err != nil {
+		if errors.Is(err, yubikey.ErrUnsupported) {
+			out.NotProgrammed = true
+			out.ProgramHint = "ykman not available; copy the printed command and run it on the router shell"
+			return out, nil
+		}
+		// Real programming failure: roll back so the user can retry.
+		_ = a.Store.DeleteAllCredentials(ctx)
+		_ = a.Store.BurnRecoveryCode(ctx)
+		return nil, fmt.Errorf("auth: program key: %w", err)
+	}
+	return out, nil
 }
 
 // LoginYubiKey runs the §5.3 YubiKey-on-router login flow. Returns the
@@ -253,34 +298,100 @@ func (a *Authenticator) BeginRegisterWebAuthn(ctx context.Context) (handle strin
 	return a.WebAuthn.BeginRegister(user)
 }
 
+// WebAuthnRegistration bundles the persisted credential ID with the
+// recovery code, when one was generated as part of this registration.
+// RecoveryCode is non-empty only when this was the first credential on
+// the device — subsequent registrations leave the existing recovery code
+// in place. Display it once and store nothing.
+type WebAuthnRegistration struct {
+	CredentialID int64
+	RecoveryCode string // non-empty iff this was the first credential
+}
+
 // FinishRegisterWebAuthn validates an attestation response and persists
 // the credential. label is what the user sees in the security UI; empty
-// label gets a sensible default. Returns the new credential's row ID.
-func (a *Authenticator) FinishRegisterWebAuthn(ctx context.Context, label, handle string, body []byte) (int64, error) {
+// label gets a sensible default. If this is the first credential on the
+// device (no others, no recovery code yet), a fresh recovery code is
+// generated and returned in the result; the caller must surface it to
+// the user exactly once.
+func (a *Authenticator) FinishRegisterWebAuthn(ctx context.Context, label, handle string, body []byte) (*WebAuthnRegistration, error) {
 	if a.WebAuthn == nil {
-		return 0, ErrNoWebAuthn
+		return nil, ErrNoWebAuthn
 	}
 	user, err := a.loadUser(ctx)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	cred, err := a.WebAuthn.FinishRegister(user, handle, body)
 	if err != nil {
-		return 0, ErrChallengeFail
+		return nil, ErrChallengeFail
 	}
 	blob, err := json.Marshal(cred)
 	if err != nil {
-		return 0, fmt.Errorf("auth: marshal credential: %w", err)
+		return nil, fmt.Errorf("auth: marshal credential: %w", err)
 	}
 	if label == "" {
 		label = "webauthn credential"
 	}
-	return a.Store.AddCredential(ctx, store.Credential{
+
+	// Detect first-credential state BEFORE inserting so we know whether
+	// to mint a recovery code.
+	firstCredential, err := isFirstCredential(ctx, a.Store)
+	if err != nil {
+		return nil, err
+	}
+
+	id, err := a.Store.AddCredential(ctx, store.Credential{
 		Kind:           store.KindWebAuthn,
 		Label:          label,
 		CredentialID:   cred.ID,
 		PublicMaterial: blob,
 	})
+	if err != nil {
+		return nil, err
+	}
+
+	out := &WebAuthnRegistration{CredentialID: id}
+	if firstCredential {
+		code, hashed, err := generateRecoveryCode()
+		if err != nil {
+			return nil, err
+		}
+		if err := a.Store.SetRecoveryCodeHash(ctx, hashed); err != nil {
+			return nil, fmt.Errorf("auth: persist recovery: %w", err)
+		}
+		out.RecoveryCode = code
+	}
+	return out, nil
+}
+
+func isFirstCredential(ctx context.Context, s *store.Store) (bool, error) {
+	creds, err := s.ListCredentials(ctx)
+	if err != nil {
+		return false, err
+	}
+	if len(creds) > 0 {
+		return false, nil
+	}
+	if _, err := s.GetRecoveryCodeHash(ctx); err == nil {
+		// No credentials but a recovery code exists — not a fresh device.
+		return false, nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return false, err
+	}
+	return true, nil
+}
+
+func generateRecoveryCode() (code string, hashed []byte, err error) {
+	code, err = bcrypto.NewRecoveryCode()
+	if err != nil {
+		return "", nil, fmt.Errorf("auth: generate recovery: %w", err)
+	}
+	hashed, err = bcrypto.HashRecoveryCode(code)
+	if err != nil {
+		return "", nil, err
+	}
+	return code, hashed, nil
 }
 
 // BeginLoginWebAuthn starts a WebAuthn authentication ceremony.

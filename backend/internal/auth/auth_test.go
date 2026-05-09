@@ -44,8 +44,9 @@ func TestProvisionAndLogin(t *testing.T) {
 	}
 
 	// Simulate the user programming their physical key with the secret.
-	yk.Program(yubikey.Slot2, res.Secret)
-	yk.Plug()
+	if err := yk.Program(context.Background(), yubikey.Slot2, res.Secret); err != nil {
+		t.Fatal(err)
+	}
 
 	id, err := a.LoginYubiKey(ctx)
 	if err != nil {
@@ -67,15 +68,18 @@ func TestLoginRejectsWrongKey(t *testing.T) {
 	for i := range wrong {
 		wrong[i] = 0xff
 	}
-	yk.Program(yubikey.Slot2, wrong)
-	yk.Plug()
+	if err := yk.Program(context.Background(), yubikey.Slot2, wrong); err != nil {
+		t.Fatal(err)
+	}
 
 	if _, err := a.LoginYubiKey(ctx); !errors.Is(err, ErrChallengeFail) {
 		t.Fatalf("expected ErrChallengeFail, got %v", err)
 	}
 
 	// Programming with the right key now should succeed.
-	yk.Program(yubikey.Slot2, res.Secret)
+	if err := yk.Program(context.Background(), yubikey.Slot2, res.Secret); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := a.LoginYubiKey(ctx); err != nil {
 		t.Fatalf("LoginYubiKey after correction: %v", err)
 	}
@@ -86,8 +90,10 @@ func TestLoginRequiresKeyPresent(t *testing.T) {
 	ctx := context.Background()
 
 	res, _ := a.ProvisionYubiKey(ctx, "")
-	yk.Program(yubikey.Slot2, res.Secret)
-	// Don't plug in.
+	if err := yk.Program(context.Background(), yubikey.Slot2, res.Secret); err != nil {
+		t.Fatal(err)
+	}
+	yk.Unplug() // programmed but disconnected: must reject
 
 	if _, err := a.LoginYubiKey(ctx); !errors.Is(err, ErrChallengeFail) {
 		t.Fatalf("expected ErrChallengeFail, got %v", err)
@@ -106,8 +112,9 @@ func TestRecoverHappyPath(t *testing.T) {
 	ctx := context.Background()
 
 	res, _ := a.ProvisionYubiKey(ctx, "")
-	yk.Program(yubikey.Slot2, res.Secret)
-	yk.Plug()
+	if err := yk.Program(context.Background(), yubikey.Slot2, res.Secret); err != nil {
+		t.Fatal(err)
+	}
 
 	// Confirm credential exists pre-recovery.
 	if has, _ := a.HasAnyCredential(ctx); !has {

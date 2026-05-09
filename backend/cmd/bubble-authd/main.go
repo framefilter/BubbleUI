@@ -106,6 +106,17 @@ func run() error {
 	yk := buildOracle(useMock)
 	a := auth.New(s, yk)
 
+	// The Programmer is what writes slot 2 during the wizard's YubiKey
+	// provision flow. In mock mode the same Mock instance services both
+	// roles. With real hardware, ykman handles it.
+	if useMock {
+		if m, ok := yk.(*yubikey.Mock); ok {
+			a.Programmer = m
+		}
+	} else {
+		a.Programmer = yubikey.NewYkmanProgrammer()
+	}
+
 	cmd := flag.Arg(0)
 	args := flag.Args()[1:]
 	switch cmd {
@@ -166,8 +177,9 @@ func cmdLogin(ctx context.Context, a *auth.Authenticator, dbPath string, useMock
 		if !ok {
 			return errors.New("internal: -mock did not yield a Mock oracle")
 		}
-		m.Program(yubikey.Slot2, secret)
-		m.Plug()
+		if err := m.Program(ctx, yubikey.Slot2, secret); err != nil {
+			return fmt.Errorf("mock program: %w", err)
+		}
 	}
 
 	id, err := a.LoginYubiKey(ctx)
@@ -245,8 +257,7 @@ func cmdServe(ctx context.Context, a *auth.Authenticator, s *store.Store, useMoc
 	if useMock {
 		if m, ok := yk.(*yubikey.Mock); ok {
 			if secret, err := loadMockSecret(dbPath); err == nil {
-				m.Program(yubikey.Slot2, secret)
-				m.Plug()
+				_ = m.Program(ctx, yubikey.Slot2, secret)
 			}
 		}
 	}

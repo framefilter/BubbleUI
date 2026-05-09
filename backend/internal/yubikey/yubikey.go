@@ -38,6 +38,22 @@ type Oracle interface {
 	Present(ctx context.Context) bool
 }
 
+// Programmer writes an HMAC-SHA1 secret into a slot of an attached YubiKey.
+// Used by the wizard's provision flow to set up slot 2 without making the
+// user run ykman manually.
+//
+// On the router we shell out to `ykman otp chalresp --touch <slot> <hex>`.
+// On dev workstations without ykman, the bound implementation returns
+// ErrUnsupported and the wizard surfaces a copy-pasteable command for the
+// user to run themselves.
+type Programmer interface {
+	Program(ctx context.Context, slot Slot, secret []byte) error
+}
+
+// ErrUnsupported is returned when the bound Programmer cannot service a
+// request — typically because `ykman` is not installed on this machine.
+var ErrUnsupported = errors.New("yubikey: programming unsupported (ykman missing or not allowed)")
+
 // CLI is an Oracle that shells out to the ykchalresp command-line tool.
 type CLI struct {
 	// Path overrides the ykchalresp binary path for testing.
@@ -90,4 +106,37 @@ func (c *CLI) Present(ctx context.Context) bool {
 		return true
 	}
 	return false
+}
+
+// YkmanProgrammer writes secrets via `ykman otp chalresp`. Returns
+// ErrUnsupported when ykman is not on PATH.
+type YkmanProgrammer struct {
+	// Path overrides the ykman binary location (mostly for testing).
+	Path string
+}
+
+// NewYkmanProgrammer returns a default-configured programmer.
+func NewYkmanProgrammer() *YkmanProgrammer { return &YkmanProgrammer{Path: "ykman"} }
+
+// Program implements Programmer.
+func (p *YkmanProgrammer) Program(ctx context.Context, slot Slot, secret []byte) error {
+	if slot != Slot1 && slot != Slot2 {
+		return fmt.Errorf("yubikey: invalid slot %d", slot)
+	}
+	if len(secret) == 0 {
+		return errors.New("yubikey: empty secret")
+	}
+	bin := p.Path
+	if bin == "" {
+		bin = "ykman"
+	}
+	if _, err := exec.LookPath(bin); err != nil {
+		return ErrUnsupported
+	}
+	args := []string{"otp", "chalresp", "--force", "--touch", fmt.Sprintf("%d", int(slot)), hex.EncodeToString(secret)}
+	out, err := exec.CommandContext(ctx, bin, args...).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("yubikey: ykman: %w (%s)", err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }
