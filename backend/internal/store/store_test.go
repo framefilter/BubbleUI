@@ -1,0 +1,200 @@
+package store
+
+import (
+	"bytes"
+	"context"
+	"database/sql"
+	"errors"
+	"path/filepath"
+	"testing"
+)
+
+func newStore(t *testing.T) *Store {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "creds.db")
+	s, err := Open(context.Background(), path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	return s
+}
+
+func TestSchemaIsIdempotent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "creds.db")
+	for i := 0; i < 3; i++ {
+		s, err := Open(context.Background(), path)
+		if err != nil {
+			t.Fatalf("Open #%d: %v", i, err)
+		}
+		_ = s.Close()
+	}
+}
+
+func TestAddAndListCredentials(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+
+	id1, err := s.AddCredential(ctx, Credential{
+		Kind:        KindYubiKeyHMAC,
+		Label:       "router yubikey",
+		PrivateBlob: []byte("wrapped-secret-1"),
+	})
+	if err != nil {
+		t.Fatalf("AddCredential yk: %v", err)
+	}
+	if id1 == 0 {
+		t.Fatal("expected nonzero id")
+	}
+
+	_, err = s.AddCredential(ctx, Credential{
+		Kind:           KindWebAuthn,
+		Label:          "macbook touchid",
+		CredentialID:   []byte("cred-id-bytes"),
+		PublicMaterial: []byte("cose-public-key"),
+	})
+	if err != nil {
+		t.Fatalf("AddCredential webauthn: %v", err)
+	}
+
+	got, err := s.ListCredentials(ctx)
+	if err != nil {
+		t.Fatalf("ListCredentials: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d credentials, want 2", len(got))
+	}
+	if got[0].Kind != KindYubiKeyHMAC || got[1].Kind != KindWebAuthn {
+		t.Fatalf("ordering wrong: %v / %v", got[0].Kind, got[1].Kind)
+	}
+	if !bytes.Equal(got[0].PrivateBlob, []byte("wrapped-secret-1")) {
+		t.Fatal("yk private blob roundtrip failed")
+	}
+}
+
+func TestGetCredentialByKind(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	if _, err := s.GetCredentialByKind(ctx, KindYubiKeyHMAC); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("expected sql.ErrNoRows, got %v", err)
+	}
+	_, err := s.AddCredential(ctx, Credential{
+		Kind:        KindYubiKeyHMAC,
+		Label:       "yk",
+		PrivateBlob: []byte("blob"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := s.GetCredentialByKind(ctx, KindYubiKeyHMAC)
+	if err != nil {
+		t.Fatalf("GetCredentialByKind: %v", err)
+	}
+	if string(c.PrivateBlob) != "blob" {
+		t.Fatal("blob mismatch")
+	}
+}
+
+func TestRequiresKindAndLabel(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	if _, err := s.AddCredential(ctx, Credential{Label: "x"}); err == nil {
+		t.Fatal("expected error for missing kind")
+	}
+	if _, err := s.AddCredential(ctx, Credential{Kind: KindYubiKeyHMAC}); err == nil {
+		t.Fatal("expected error for missing label")
+	}
+}
+
+func TestRecoveryCodeRoundtrip(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+
+	if _, err := s.GetRecoveryCodeHash(ctx); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("expected sql.ErrNoRows, got %v", err)
+	}
+
+	hash := bytes.Repeat([]byte{0x55}, 32)
+	if err := s.SetRecoveryCodeHash(ctx, hash); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	got, err := s.GetRecoveryCodeHash(ctx)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if !bytes.Equal(got, hash) {
+		t.Fatalf("roundtrip mismatch")
+	}
+
+	// Replacing should overwrite.
+	hash2 := bytes.Repeat([]byte{0xaa}, 32)
+	if err := s.SetRecoveryCodeHash(ctx, hash2); err != nil {
+		t.Fatalf("Set replace: %v", err)
+	}
+	got, _ = s.GetRecoveryCodeHash(ctx)
+	if !bytes.Equal(got, hash2) {
+		t.Fatal("replace did not overwrite")
+	}
+}
+
+func TestBurnRecoveryCode(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+
+	if err := s.BurnRecoveryCode(ctx); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("expected sql.ErrNoRows on burn-without-set, got %v", err)
+	}
+
+	original := bytes.Repeat([]byte{0x11}, 32)
+	if err := s.SetRecoveryCodeHash(ctx, original); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.BurnRecoveryCode(ctx); err != nil {
+		t.Fatalf("BurnRecoveryCode: %v", err)
+	}
+	got, err := s.GetRecoveryCodeHash(ctx)
+	if err != nil {
+		t.Fatalf("Get post-burn: %v", err)
+	}
+	if bytes.Equal(got, original) {
+		t.Fatal("burn did not change hash")
+	}
+	if len(got) != 32 {
+		t.Fatalf("post-burn hash len = %d, want 32", len(got))
+	}
+}
+
+func TestDeleteAllCredentials(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	for i := 0; i < 3; i++ {
+		_, err := s.AddCredential(ctx, Credential{
+			Kind:        KindYubiKeyHMAC,
+			Label:       "yk",
+			PrivateBlob: []byte{byte(i)},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.DeleteAllCredentials(ctx); err != nil {
+		t.Fatalf("DeleteAllCredentials: %v", err)
+	}
+	got, _ := s.ListCredentials(ctx)
+	if len(got) != 0 {
+		t.Fatalf("expected 0 after delete, got %d", len(got))
+	}
+}
+
+func TestMarkCredentialUsed(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	id, _ := s.AddCredential(ctx, Credential{Kind: KindYubiKeyHMAC, Label: "yk", PrivateBlob: []byte("x")})
+	if err := s.MarkCredentialUsed(ctx, id); err != nil {
+		t.Fatalf("MarkCredentialUsed: %v", err)
+	}
+	c, _ := s.GetCredentialByKind(ctx, KindYubiKeyHMAC)
+	if c.LastUsedAt.IsZero() {
+		t.Fatal("LastUsedAt was not updated")
+	}
+}
