@@ -12,9 +12,13 @@ Go services that back the BubbleUI web UI.
   time-boxed sign-in window state machine. nftables / dnsmasq
   integration lives behind an Applier interface; the dev binary
   uses NoopApplier and logs what it would have done.
+- `bubble-hwd` — DESIGN.md §13.5/§13.6 hardware adapter: status LED
+  state machine + GPIO button events. Drives /sys/class/leds on the
+  router (auto-detects mono vs RGB) and /dev/input/event* for
+  buttons. Dev binary uses MockDriver; pass -mock to force.
 
 `ubus` integration on the router lands in M3 proper. For now all
-three daemons run as independent HTTP servers.
+four daemons run as independent HTTP servers (8765 / 8766 / 8767 / 8768).
 
 ## Quick start
 
@@ -94,7 +98,8 @@ backend/
 ├── cmd/
 │   ├── bubble-authd/      auth daemon (CLI + HTTP)
 │   ├── bubble-vpnd/       VPN daemon (HTTP, /vpn surface)
-│   └── bubble-netd/       net/firewall daemon (HTTP, /net surface)
+│   ├── bubble-netd/       net/firewall daemon (HTTP, /net surface)
+│   └── bubble-hwd/        hardware adapter daemon (HTTP, /hw surface)
 ├── internal/
 │   ├── auth/              Provision/Login/Recover (YubiKey + WebAuthn)
 │   ├── crypto/            self-wrap (HMAC→HKDF→AES-256-GCM), recovery codes
@@ -109,7 +114,10 @@ backend/
 │   ├── vpnapi/            bubble-vpnd HTTP handlers + StubConnector
 │   ├── captive/           captive-portal detection probe
 │   ├── signin/            §6.5 sign-in window state machine + Applier
-│   └── netapi/            bubble-netd HTTP handlers
+│   ├── netapi/            bubble-netd HTTP handlers
+│   ├── led/               LED state machine + Mock/Sysfs drivers
+│   ├── buttons/           GPIO button events (Mock + Linux stub)
+│   └── hwapi/             bubble-hwd HTTP handlers
 └── go.mod
 ```
 
