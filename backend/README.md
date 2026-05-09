@@ -8,9 +8,13 @@ Go services that back the BubbleUI web UI.
   saved WireGuard configs, parallel TCP-connect probing, "connect to
   fastest" as the default action. wg-quick integration lives behind
   a Connector interface; the dev binary uses StubConnector.
+- `bubble-netd` — DESIGN.md §6.5 captive-portal detection + the
+  time-boxed sign-in window state machine. nftables / dnsmasq
+  integration lives behind an Applier interface; the dev binary
+  uses NoopApplier and logs what it would have done.
 
-`ubus` integration on the router lands in M3 proper. For now both
-daemons run as independent HTTP servers.
+`ubus` integration on the router lands in M3 proper. For now all
+three daemons run as independent HTTP servers.
 
 ## Quick start
 
@@ -89,7 +93,8 @@ Touch the key when it blinks.
 backend/
 ├── cmd/
 │   ├── bubble-authd/      auth daemon (CLI + HTTP)
-│   └── bubble-vpnd/       VPN daemon (HTTP, /vpn surface)
+│   ├── bubble-vpnd/       VPN daemon (HTTP, /vpn surface)
+│   └── bubble-netd/       net/firewall daemon (HTTP, /net surface)
 ├── internal/
 │   ├── auth/              Provision/Login/Recover (YubiKey + WebAuthn)
 │   ├── crypto/            self-wrap (HMAC→HKDF→AES-256-GCM), recovery codes
@@ -101,7 +106,10 @@ backend/
 │   ├── wgpool/            VPN config SQLite + .conf parser
 │   ├── prober/            parallel TCP-connect probe
 │   ├── selector/          rank candidates by probe RTT
-│   └── vpnapi/            bubble-vpnd HTTP handlers + StubConnector
+│   ├── vpnapi/            bubble-vpnd HTTP handlers + StubConnector
+│   ├── captive/           captive-portal detection probe
+│   ├── signin/            §6.5 sign-in window state machine + Applier
+│   └── netapi/            bubble-netd HTTP handlers
 └── go.mod
 ```
 
