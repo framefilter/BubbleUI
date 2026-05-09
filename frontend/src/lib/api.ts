@@ -131,3 +131,110 @@ export const webauthnLoginBegin = () =>
 
 export const webauthnLoginFinish = (handle: string, response: unknown) =>
   request<LoginOk>('POST', '/auth/webauthn/login/finish', { handle, response });
+
+// --- VPN (bubble-vpnd) ---
+
+export interface VPNConfig {
+  id: number;
+  label: string;
+  endpoint: string;
+  endpoint_host: string;
+  endpoint_port: number;
+  enabled: boolean;
+  created_at: number;
+  last_probe_at?: number;
+  last_probe_rtt_ms?: number;
+  last_probe_err?: string;
+  last_handshake_at?: number;
+  // Only present in /vpn/probe responses:
+  probe_rtt_ms?: number;
+  probe_err?: string;
+}
+
+export interface VPNStatus {
+  active_id: number;
+  label?: string;
+  endpoint?: string;
+}
+
+export const vpnList = () => request<{ configs: VPNConfig[] }>('GET', '/vpn/configs');
+
+export const vpnImport = (label: string, raw: string) =>
+  request<{ id: number }>('POST', '/vpn/configs', { label, raw });
+
+async function deleteJSON<T>(path: string): Promise<ApiResult<T>> {
+  let res: Response;
+  try {
+    res = await fetch(path, { method: 'DELETE', credentials: 'same-origin' });
+  } catch (e) {
+    return { ok: false, error: { status: 0, error: (e as Error).message ?? 'network error' } };
+  }
+  let payload: unknown;
+  try {
+    payload = await res.json();
+  } catch {
+    payload = null;
+  }
+  if (!res.ok) {
+    const err = (payload as { error?: string } | null)?.error ?? res.statusText;
+    return { ok: false, error: { status: res.status, error: err } };
+  }
+  return { ok: true, data: payload as T };
+}
+
+export const vpnDelete = (id: number) =>
+  deleteJSON<{ status: string }>('/vpn/configs/' + id);
+
+export const vpnSetEnabled = (id: number, enabled: boolean) =>
+  request<{ status: string }>('POST', '/vpn/configs/' + id + '/enabled', { enabled });
+
+export const vpnProbe = () =>
+  request<{ ranked: VPNConfig[]; probed: number; skipped: number }>('POST', '/vpn/probe', {});
+
+export interface VPNConnectOk {
+  status: string;
+  id: number;
+  label: string;
+  endpoint: string;
+}
+
+export const vpnConnectFastest = () =>
+  request<VPNConnectOk>('POST', '/vpn/connect', { strategy: 'fastest' });
+
+export const vpnConnectByID = (id: number) =>
+  request<VPNConnectOk>('POST', '/vpn/connect', { id });
+
+export const vpnDisconnect = () =>
+  request<{ status: string }>('POST', '/vpn/disconnect', {});
+
+export const vpnStatus = () => request<VPNStatus>('GET', '/vpn/status');
+
+// --- Net / captive (bubble-netd) ---
+
+export interface CaptiveStatus {
+  captive: boolean;
+  portal_ips: string[] | null;
+  evidence_url: string;
+}
+
+export interface SigninStatus {
+  state: 'closed' | 'open' | 'expiring';
+  strict_mode: boolean;
+  allowed_ports: number[];
+  opened_at?: number;
+  deadline?: number;
+  remaining_sec?: number;
+  portal_ips?: string[];
+}
+
+export const netCaptive = () => request<CaptiveStatus>('GET', '/net/captive');
+export const netSigninStatus = () => request<SigninStatus>('GET', '/net/signin/status');
+
+export const netSigninOpen = (portal_ips: string[], duration_sec?: number) =>
+  request<{ status: string }>('POST', '/net/signin/open', { portal_ips, duration_sec });
+
+export const netSigninClose = () =>
+  request<{ status: string }>('POST', '/net/signin/close', {});
+
+export const netSigninStrict = (enabled: boolean) =>
+  request<{ strict_mode: boolean }>('POST', '/net/signin/strict', { enabled });
