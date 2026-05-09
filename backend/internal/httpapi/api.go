@@ -3,14 +3,23 @@
 //
 // Routing surface (all paths return JSON):
 //
-//	POST /auth/yubikey/login    — run §5.3 YubiKey login, mint a session
-//	POST /auth/recover          — run §5.4 recovery; wipes credentials
-//	GET  /auth/session/whoami   — return the current session, if any
-//	POST /auth/session/logout   — revoke the current session
-//	POST /api/time/sync         — accept browser-supplied time per §6.6
+//	POST /auth/yubikey/login                — run §5.3 YubiKey login
+//	POST /auth/webauthn/register/begin      — start a WebAuthn registration
+//	POST /auth/webauthn/register/finish     — finish registration, persist
+//	POST /auth/webauthn/login/begin         — start a WebAuthn login
+//	POST /auth/webauthn/login/finish        — finish login, mint session
+//	POST /auth/recover                      — run §5.4 recovery
+//	GET  /auth/session/whoami               — current session, if any
+//	POST /auth/session/logout               — revoke the current session
+//	POST /api/time/sync                     — browser-supplied time per §6.6
 //
 // Cookies: bubble-session, HttpOnly, SameSite=Strict, Secure (when TLS),
 // Path=/. CSRF defense is layered: SameSite=Strict + an Origin allowlist.
+//
+// WebAuthn registration is "auth-required unless no credentials exist
+// yet" — bootstrap mode lets the wizard register the first credential
+// without a session, after which adding more credentials requires being
+// logged in.
 package httpapi
 
 import (
@@ -92,6 +101,10 @@ func (s *Server) handler() http.Handler {
 
 func (s *Server) routes() {
 	s.mux.HandleFunc("POST /auth/yubikey/login", s.handleYubiKeyLogin)
+	s.mux.HandleFunc("POST /auth/webauthn/register/begin", s.handleWebAuthnRegisterBegin)
+	s.mux.HandleFunc("POST /auth/webauthn/register/finish", s.handleWebAuthnRegisterFinish)
+	s.mux.HandleFunc("POST /auth/webauthn/login/begin", s.handleWebAuthnLoginBegin)
+	s.mux.HandleFunc("POST /auth/webauthn/login/finish", s.handleWebAuthnLoginFinish)
 	s.mux.HandleFunc("POST /auth/recover", s.handleRecover)
 	s.mux.HandleFunc("GET /auth/session/whoami", s.handleWhoami)
 	s.mux.HandleFunc("POST /auth/session/logout", s.handleLogout)
@@ -119,6 +132,112 @@ func (s *Server) handleYubiKeyLogin(w http.ResponseWriter, r *http.Request) {
 		"credential_id": credID,
 		"expires_at":    sess.ExpiresAt.Unix(),
 	})
+}
+
+// --- WebAuthn handlers ---
+
+type webAuthnFinishRequest struct {
+	Handle   string          `json:"handle"`
+	Response json.RawMessage `json:"response"`
+	Label    string          `json:"label"` // optional; ignored on login
+}
+
+type webAuthnBeginResponse struct {
+	Handle  string          `json:"handle"`
+	Options json.RawMessage `json:"options"`
+}
+
+func (s *Server) handleWebAuthnRegisterBegin(w http.ResponseWriter, r *http.Request) {
+	if !s.requireBootstrapOrSession(w, r) {
+		return
+	}
+	handle, options, err := s.cfg.Auth.BeginRegisterWebAuthn(r.Context())
+	if err != nil {
+		s.logger.Error("webauthn begin register", "err", err)
+		writeError(w, http.StatusInternalServerError, "internal")
+		return
+	}
+	writeJSON(w, http.StatusOK, webAuthnBeginResponse{Handle: handle, Options: options})
+}
+
+func (s *Server) handleWebAuthnRegisterFinish(w http.ResponseWriter, r *http.Request) {
+	if !s.requireBootstrapOrSession(w, r) {
+		return
+	}
+	var req webAuthnFinishRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "bad request")
+		return
+	}
+	if req.Handle == "" || len(req.Response) == 0 {
+		writeError(w, http.StatusBadRequest, "handle and response required")
+		return
+	}
+	id, err := s.cfg.Auth.FinishRegisterWebAuthn(r.Context(), req.Label, req.Handle, req.Response)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "rejected")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"credential_id": id})
+}
+
+func (s *Server) handleWebAuthnLoginBegin(w http.ResponseWriter, r *http.Request) {
+	handle, options, err := s.cfg.Auth.BeginLoginWebAuthn(r.Context())
+	if err != nil {
+		// Treat "no credential of that kind" the same as "rejected" — we
+		// don't want to advertise whether any WebAuthn credentials exist.
+		writeError(w, http.StatusUnauthorized, "rejected")
+		return
+	}
+	writeJSON(w, http.StatusOK, webAuthnBeginResponse{Handle: handle, Options: options})
+}
+
+func (s *Server) handleWebAuthnLoginFinish(w http.ResponseWriter, r *http.Request) {
+	var req webAuthnFinishRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "bad request")
+		return
+	}
+	if req.Handle == "" || len(req.Response) == 0 {
+		writeError(w, http.StatusBadRequest, "handle and response required")
+		return
+	}
+	credID, err := s.cfg.Auth.FinishLoginWebAuthn(r.Context(), req.Handle, req.Response)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "rejected")
+		return
+	}
+	token, sess, err := s.cfg.Sessions.Create(r.Context(), credID)
+	if err != nil {
+		s.logger.Error("session create failed", "err", err)
+		writeError(w, http.StatusInternalServerError, "internal")
+		return
+	}
+	s.setSessionCookie(w, token, sess.ExpiresAt)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"credential_id": credID,
+		"expires_at":    sess.ExpiresAt.Unix(),
+	})
+}
+
+// requireBootstrapOrSession allows the request if either no credentials
+// have been registered yet (first-boot wizard) OR the request carries a
+// valid session. Writes a 401 and returns false on rejection.
+func (s *Server) requireBootstrapOrSession(w http.ResponseWriter, r *http.Request) bool {
+	has, err := s.cfg.Auth.HasAnyCredential(r.Context())
+	if err != nil {
+		s.logger.Error("HasAnyCredential", "err", err)
+		writeError(w, http.StatusInternalServerError, "internal")
+		return false
+	}
+	if !has {
+		return true
+	}
+	if _, ok := sessionFromRequest(r, s.cfg.Sessions); ok {
+		return true
+	}
+	writeError(w, http.StatusUnauthorized, "auth required")
+	return false
 }
 
 type recoverRequest struct {

@@ -27,6 +27,7 @@ import (
 	"github.com/framefilter/bubbleui/backend/internal/httpapi"
 	"github.com/framefilter/bubbleui/backend/internal/session"
 	"github.com/framefilter/bubbleui/backend/internal/store"
+	"github.com/framefilter/bubbleui/backend/internal/webauthn"
 	"github.com/framefilter/bubbleui/backend/internal/yubikey"
 )
 
@@ -41,9 +42,11 @@ Commands:
   login               Run the login flow against the attached YubiKey.
   recover <code>      Burn the recovery code and wipe credentials.
   status              Show registered credentials.
-  serve [-listen ADDR] [-allowed-origin URL] [-insecure]
+  serve [-listen ADDR] [-allowed-origin URL] [-insecure] [-rp-id HOST]
                       Run the HTTP server. Defaults to 127.0.0.1:8765,
                       cookies marked Secure, no Origin allowlist.
+                      Pass -rp-id to enable WebAuthn (matches the
+                      hostname the SPA is loaded from, no scheme/port).
   -h, --help          Show this help.
 
 Flags:
@@ -231,6 +234,8 @@ func cmdServe(ctx context.Context, a *auth.Authenticator, s *store.Store, useMoc
 	insecure := fs.Bool("insecure", false, "drop the Secure flag from session cookies (plain HTTP only)")
 	originList := fs.String("allowed-origin", "", "comma-separated Origin allowlist; empty = no check")
 	allowSetTime := fs.Bool("allow-set-time", false, "allow /api/time/sync with force=true to actually call date -s; without this flag, time-sync only reports skew")
+	rpID := fs.String("rp-id", "", "WebAuthn relying party ID (hostname without scheme/port). Empty disables WebAuthn endpoints.")
+	rpName := fs.String("rp-name", "BubbleUI", "WebAuthn relying party display name")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -249,6 +254,30 @@ func cmdServe(ctx context.Context, a *auth.Authenticator, s *store.Store, useMoc
 	mgr, err := session.NewManager(ctx, s.DB())
 	if err != nil {
 		return fmt.Errorf("session manager: %w", err)
+	}
+
+	// Configure WebAuthn if -rp-id was provided. WebAuthn requires at
+	// least one origin to be allowed; if -allowed-origin wasn't passed,
+	// derive a sensible default from the RP ID (https in normal mode,
+	// http in -insecure mode).
+	if *rpID != "" {
+		origins := splitNonEmpty(*originList)
+		if len(origins) == 0 {
+			scheme := "https"
+			if *insecure || *tlsCert == "" {
+				scheme = "http"
+			}
+			origins = []string{scheme + "://" + *rpID}
+		}
+		eng, err := webauthn.New(webauthn.Config{
+			RPID:          *rpID,
+			RPDisplayName: *rpName,
+			Origins:       origins,
+		})
+		if err != nil {
+			return fmt.Errorf("webauthn: %w", err)
+		}
+		a.WebAuthn = eng
 	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -275,7 +304,8 @@ func cmdServe(ctx context.Context, a *auth.Authenticator, s *store.Store, useMoc
 		_ = srv.Shutdown(shutdownCtx)
 	}()
 
-	// Periodic session sweep so expired rows don't accumulate.
+	// Periodic sweep: HTTP sessions and (if enabled) pending WebAuthn
+	// ceremonies. Cheap; runs every 15 minutes.
 	go func() {
 		t := time.NewTicker(15 * time.Minute)
 		defer t.Stop()
@@ -285,6 +315,9 @@ func cmdServe(ctx context.Context, a *auth.Authenticator, s *store.Store, useMoc
 				return
 			case <-t.C:
 				_ = mgr.PurgeExpired(context.Background())
+				if a.WebAuthn != nil {
+					a.WebAuthn.Sweep()
+				}
 			}
 		}
 	}()

@@ -34,11 +34,15 @@ All endpoints return JSON. Cookies are `bubble-session`,
 
 | Method | Path | Body | Notes |
 |---|---|---|---|
-| POST | `/auth/yubikey/login`     | none                 | Runs §5.3 YubiKey login. Mints a session cookie. |
-| POST | `/auth/recover`           | `{"code":"…"}`       | Runs §5.4 recovery. Wipes credentials and revokes all sessions. |
-| GET  | `/auth/session/whoami`    | n/a                  | Returns `{authenticated, credential_id, expires_at}`. |
-| POST | `/auth/session/logout`    | none                 | Revokes the current session. |
-| POST | `/api/time/sync`          | `{"now":<ms>, "force":bool}` | Browser-supplied time per §6.6. Without `force`, reports skew but never sets the clock. |
+| POST | `/auth/yubikey/login`              | none                                 | Runs §5.3 YubiKey login. Mints a session cookie. |
+| POST | `/auth/webauthn/register/begin`    | `{}`                                 | Starts a registration ceremony. Returns `{handle, options}`; forward `options.publicKey` to `navigator.credentials.create()`. |
+| POST | `/auth/webauthn/register/finish`   | `{handle, response, label?}`         | Validates the attestation, persists the credential. Auth-gated: requires a session unless no credentials are registered yet. |
+| POST | `/auth/webauthn/login/begin`       | `{}`                                 | Starts an authentication ceremony. Returns `{handle, options}`; forward to `navigator.credentials.get()`. |
+| POST | `/auth/webauthn/login/finish`      | `{handle, response}`                 | Validates the assertion, mints a session cookie. |
+| POST | `/auth/recover`                    | `{"code":"…"}`                       | Runs §5.4 recovery. Wipes credentials and revokes all sessions. |
+| GET  | `/auth/session/whoami`             | n/a                                  | Returns `{authenticated, credential_id, expires_at}`. |
+| POST | `/auth/session/logout`             | none                                 | Revokes the current session. |
+| POST | `/api/time/sync`                   | `{"now":<ms>, "force":bool}`         | Browser-supplied time per §6.6. Without `force`, reports skew but never sets the clock. |
 
 ### `serve` flags
 
@@ -49,6 +53,8 @@ All endpoints return JSON. Cookies are `bubble-session`,
 | `-insecure`              | false  | drop the `Secure` cookie flag (plain-HTTP dev) |
 | `-allowed-origin URL,…`  | unset  | comma-separated Origin allowlist; empty = no check |
 | `-allow-set-time`        | false  | wire `/api/time/sync` to actually call `date -s` when `force=true`. Without this, the endpoint can only *report* skew. |
+| `-rp-id HOST`            | unset  | WebAuthn Relying Party ID (the host without scheme/port — e.g. `bubble.local`). Empty disables the four `/auth/webauthn/*` endpoints. |
+| `-rp-name NAME`          | `BubbleUI` | WebAuthn display name shown in the browser's authenticator UI. |
 
 ## Running against a real YubiKey
 
@@ -77,11 +83,12 @@ backend/
 ├── cmd/
 │   └── bubble-authd/      CLI + HTTP server
 ├── internal/
-│   ├── auth/              ProvisionYubiKey / LoginYubiKey / Recover
+│   ├── auth/              Provision/Login/Recover (YubiKey + WebAuthn)
 │   ├── crypto/            self-wrap (HMAC→HKDF→AES-256-GCM), recovery codes
 │   ├── store/             SQLite credentials.db (modernc.org/sqlite, no CGO)
 │   ├── session/           HTTP session minting / validation / revocation
 │   ├── httpapi/           HTTP handlers + Origin/security middleware
+│   ├── webauthn/          go-webauthn wrapper + pending-flow state
 │   └── yubikey/           ykchalresp adapter + Mock for tests
 └── go.mod
 ```
@@ -105,14 +112,18 @@ All four packages have unit tests that run on plain `go test ./...`:
   login happy path, login rejected without/with-wrong key, whoami
   in both states, logout, recover (good code + bad code + missing
   code), time-sync (in tolerance / out of tolerance / force / no
-  setter / bad input), security headers, Origin allowlist.
+  setter / bad input), security headers, Origin allowlist,
+  WebAuthn register/login bootstrap-vs-auth-gated paths.
+- `webauthn`: engine wraps go-webauthn — begin returns valid options,
+  unknown handle rejected, malformed body rejected, handles consumed
+  exactly once, expired handles purged via Sweep().
 
 ## What's not yet wired
 
 - ubus surface (M3 proper). The HTTP server is a transitional shape —
   on the router it'll sit behind uhttpd's TLS termination, while
   `bubble-vpnd` / `bubble-netd` / `bubble-hwd` come up as ubus objects.
-- WebAuthn registration and assertion verification. The schema and
-  credential model already accommodate it; flows land next.
 - LED state callouts via `bubble-hwd` (M3 once that exists).
 - Cross-compilation to OpenWRT's `ipq60xx` target (M3+).
+- The cryptographic happy path of WebAuthn finish/login — exercised
+  only by real browsers. Wiring + error-path coverage is unit-tested.

@@ -9,6 +9,7 @@ package store
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -90,6 +91,10 @@ func (s *Store) migrate(ctx context.Context) error {
 			id         INTEGER PRIMARY KEY CHECK (id = 1),
 			hash       BLOB    NOT NULL,
 			created_at INTEGER NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS meta (
+			key   TEXT PRIMARY KEY,
+			value BLOB NOT NULL
 		)`,
 	}
 	for _, q := range stmts {
@@ -226,4 +231,107 @@ func nullableBytes(b []byte) any {
 		return nil
 	}
 	return b
+}
+
+// --- meta key/value ---
+
+// MetaSet writes a value under key, replacing any existing value.
+func (s *Store) MetaSet(ctx context.Context, key string, value []byte) error {
+	if key == "" {
+		return errors.New("store: empty meta key")
+	}
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO meta(key, value) VALUES (?, ?)
+		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+		key, value)
+	return err
+}
+
+// MetaGet returns the stored value or sql.ErrNoRows.
+func (s *Store) MetaGet(ctx context.Context, key string) ([]byte, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT value FROM meta WHERE key = ?`, key)
+	var v []byte
+	if err := row.Scan(&v); err != nil {
+		return nil, err
+	}
+	return v, nil
+}
+
+// EnsureUserID returns the WebAuthn user-ID for this device, generating a
+// fresh 16-byte random value on first call and persisting it. Subsequent
+// calls return the same value.
+func (s *Store) EnsureUserID(ctx context.Context) ([]byte, error) {
+	const key = "webauthn_user_id"
+	if existing, err := s.MetaGet(ctx, key); err == nil {
+		return existing, nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
+	fresh := make([]byte, 16)
+	if _, err := rand.Read(fresh); err != nil {
+		return nil, fmt.Errorf("store: rand: %w", err)
+	}
+	if err := s.MetaSet(ctx, key, fresh); err != nil {
+		return nil, err
+	}
+	return fresh, nil
+}
+
+// --- credential lookups beyond the kind/index pair ---
+
+// ListCredentialsByKind returns credentials of the given kind, oldest first.
+func (s *Store) ListCredentialsByKind(ctx context.Context, kind CredentialKind) ([]Credential, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, kind, label, credential_id, public_material, private_blob, created_at, last_used_at
+		 FROM credentials WHERE kind = ? ORDER BY created_at ASC`,
+		string(kind))
+	if err != nil {
+		return nil, fmt.Errorf("store: list by kind: %w", err)
+	}
+	defer rows.Close()
+	var out []Credential
+	for rows.Next() {
+		var c Credential
+		var k string
+		var created, used int64
+		if err := rows.Scan(&c.ID, &k, &c.Label, &c.CredentialID, &c.PublicMaterial, &c.PrivateBlob, &created, &used); err != nil {
+			return nil, err
+		}
+		c.Kind = CredentialKind(k)
+		c.CreatedAt = time.Unix(created, 0)
+		if used > 0 {
+			c.LastUsedAt = time.Unix(used, 0)
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// GetCredentialByID returns the credential whose WebAuthn credential_id
+// matches, or sql.ErrNoRows.
+func (s *Store) GetCredentialByID(ctx context.Context, credentialID []byte) (Credential, error) {
+	row := s.db.QueryRowContext(ctx,
+		`SELECT id, kind, label, credential_id, public_material, private_blob, created_at, last_used_at
+		 FROM credentials WHERE credential_id = ?`, credentialID)
+	var c Credential
+	var k string
+	var created, used int64
+	if err := row.Scan(&c.ID, &k, &c.Label, &c.CredentialID, &c.PublicMaterial, &c.PrivateBlob, &created, &used); err != nil {
+		return Credential{}, err
+	}
+	c.Kind = CredentialKind(k)
+	c.CreatedAt = time.Unix(created, 0)
+	if used > 0 {
+		c.LastUsedAt = time.Unix(used, 0)
+	}
+	return c, nil
+}
+
+// UpdateCredentialMaterial replaces the public_material blob for an
+// existing credential. Used when go-webauthn returns an updated copy of
+// the credential after login (e.g. with an incremented sign count).
+func (s *Store) UpdateCredentialMaterial(ctx context.Context, id int64, material []byte) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE credentials SET public_material = ? WHERE id = ?`, material, id)
+	return err
 }

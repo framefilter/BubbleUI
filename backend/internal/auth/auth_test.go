@@ -2,11 +2,15 @@ package auth
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"path/filepath"
 	"testing"
 
+	gowa "github.com/go-webauthn/webauthn/webauthn"
+
 	"github.com/framefilter/bubbleui/backend/internal/store"
+	"github.com/framefilter/bubbleui/backend/internal/webauthn"
 	"github.com/framefilter/bubbleui/backend/internal/yubikey"
 )
 
@@ -174,4 +178,149 @@ func lowercase(s string) string {
 		out[i] = c
 	}
 	return string(out)
+}
+
+// --- WebAuthn flow tests ---
+//
+// We test the wiring around go-webauthn — that begin returns valid
+// options, that finish surfaces a clean ErrChallengeFail on garbage,
+// that the login path requires registered credentials, that the engine
+// is required when WebAuthn-anything is requested. The cryptographic
+// happy path requires a real authenticator and lands in browser-based
+// integration tests.
+
+func newTestAuthWithWebAuthn(t *testing.T) *Authenticator {
+	t.Helper()
+	a, _ := newTestAuth(t)
+	eng, err := webauthn.New(webauthn.Config{
+		RPID:          "bubble.local",
+		RPDisplayName: "BubbleUI test",
+		Origins:       []string{"https://bubble.local"},
+	})
+	if err != nil {
+		t.Fatalf("webauthn.New: %v", err)
+	}
+	a.WebAuthn = eng
+	return a
+}
+
+func TestWebAuthnRequiresEngine(t *testing.T) {
+	a, _ := newTestAuth(t)
+	ctx := context.Background()
+	if _, _, err := a.BeginRegisterWebAuthn(ctx); !errors.Is(err, ErrNoWebAuthn) {
+		t.Errorf("BeginRegister: expected ErrNoWebAuthn, got %v", err)
+	}
+	if _, err := a.FinishRegisterWebAuthn(ctx, "", "h", []byte("{}")); !errors.Is(err, ErrNoWebAuthn) {
+		t.Errorf("FinishRegister: expected ErrNoWebAuthn, got %v", err)
+	}
+	if _, _, err := a.BeginLoginWebAuthn(ctx); !errors.Is(err, ErrNoWebAuthn) {
+		t.Errorf("BeginLogin: expected ErrNoWebAuthn, got %v", err)
+	}
+	if _, err := a.FinishLoginWebAuthn(ctx, "h", []byte("{}")); !errors.Is(err, ErrNoWebAuthn) {
+		t.Errorf("FinishLogin: expected ErrNoWebAuthn, got %v", err)
+	}
+}
+
+func TestBeginRegisterWebAuthnIncludesPublicKey(t *testing.T) {
+	a := newTestAuthWithWebAuthn(t)
+	handle, options, err := a.BeginRegisterWebAuthn(context.Background())
+	if err != nil {
+		t.Fatalf("BeginRegisterWebAuthn: %v", err)
+	}
+	if handle == "" {
+		t.Fatal("empty handle")
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal(options, &parsed); err != nil {
+		t.Fatalf("options not JSON: %v", err)
+	}
+	if _, ok := parsed["publicKey"]; !ok {
+		t.Fatalf("missing publicKey in options: %s", options)
+	}
+}
+
+func TestFinishRegisterRejectsGarbage(t *testing.T) {
+	a := newTestAuthWithWebAuthn(t)
+	ctx := context.Background()
+	handle, _, err := a.BeginRegisterWebAuthn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.FinishRegisterWebAuthn(ctx, "label", handle, []byte("not-an-attestation")); !errors.Is(err, ErrChallengeFail) {
+		t.Fatalf("expected ErrChallengeFail, got %v", err)
+	}
+}
+
+func TestBeginLoginRequiresRegisteredCredential(t *testing.T) {
+	a := newTestAuthWithWebAuthn(t)
+	if _, _, err := a.BeginLoginWebAuthn(context.Background()); !errors.Is(err, ErrNoCredential) {
+		t.Fatalf("expected ErrNoCredential, got %v", err)
+	}
+}
+
+// fakeCredentialBlob produces a gowa.Credential JSON suitable for
+// inserting into the store. The cryptographic fields are nonsense — good
+// enough for BeginLogin (which only reads ID + Transport) but obviously
+// not for FinishLogin's signature check.
+func fakeCredentialBlob(t *testing.T, id []byte) []byte {
+	t.Helper()
+	c := gowa.Credential{
+		ID:              id,
+		PublicKey:       []byte{0xa5, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07},
+		AttestationType: "none",
+	}
+	blob, err := json.Marshal(c)
+	if err != nil {
+		t.Fatalf("marshal credential: %v", err)
+	}
+	return blob
+}
+
+func TestBeginLoginIncludesAllowedCredentials(t *testing.T) {
+	a := newTestAuthWithWebAuthn(t)
+	ctx := context.Background()
+
+	if _, err := a.Store.AddCredential(ctx, store.Credential{
+		Kind:           store.KindWebAuthn,
+		Label:          "fake",
+		CredentialID:   []byte("demo-cred"),
+		PublicMaterial: fakeCredentialBlob(t, []byte("demo-cred")),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	handle, options, err := a.BeginLoginWebAuthn(ctx)
+	if err != nil {
+		t.Fatalf("BeginLoginWebAuthn: %v", err)
+	}
+	if handle == "" {
+		t.Fatal("empty handle")
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal(options, &parsed); err != nil {
+		t.Fatalf("options: %v", err)
+	}
+	pk, _ := parsed["publicKey"].(map[string]any)
+	allow, _ := pk["allowCredentials"].([]any)
+	if len(allow) == 0 {
+		t.Fatalf("expected allowCredentials populated, got %v", pk)
+	}
+}
+
+func TestFinishLoginRejectsGarbage(t *testing.T) {
+	a := newTestAuthWithWebAuthn(t)
+	ctx := context.Background()
+	_, _ = a.Store.AddCredential(ctx, store.Credential{
+		Kind:           store.KindWebAuthn,
+		Label:          "fake",
+		CredentialID:   []byte("demo-cred"),
+		PublicMaterial: fakeCredentialBlob(t, []byte("demo-cred")),
+	})
+	handle, _, err := a.BeginLoginWebAuthn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.FinishLoginWebAuthn(ctx, handle, []byte("trash")); !errors.Is(err, ErrChallengeFail) {
+		t.Fatalf("expected ErrChallengeFail, got %v", err)
+	}
 }

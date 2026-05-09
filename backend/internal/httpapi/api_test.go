@@ -13,9 +13,12 @@ import (
 	"testing"
 	"time"
 
+	gowa "github.com/go-webauthn/webauthn/webauthn"
+
 	"github.com/framefilter/bubbleui/backend/internal/auth"
 	"github.com/framefilter/bubbleui/backend/internal/session"
 	"github.com/framefilter/bubbleui/backend/internal/store"
+	"github.com/framefilter/bubbleui/backend/internal/webauthn"
 	"github.com/framefilter/bubbleui/backend/internal/yubikey"
 )
 
@@ -39,6 +42,19 @@ func newRig(t *testing.T) *testRig {
 
 	mock := yubikey.NewMock()
 	a := auth.New(s, mock)
+
+	// Every rig gets a WebAuthn engine — the new endpoints assume one is
+	// configured, and crypto-free tests still need it to route correctly.
+	eng, err := webauthn.New(webauthn.Config{
+		RPID:          "bubble.local",
+		RPDisplayName: "BubbleUI test",
+		Origins:       []string{"https://bubble.local"},
+	})
+	if err != nil {
+		t.Fatalf("webauthn.New: %v", err)
+	}
+	a.WebAuthn = eng
+
 	mgr, err := session.NewManager(context.Background(), s.DB())
 	if err != nil {
 		t.Fatalf("session.NewManager: %v", err)
@@ -438,6 +454,197 @@ func TestOriginCheckBlocksDisallowed(t *testing.T) {
 	defer resp2.Body.Close()
 	if resp2.StatusCode == http.StatusForbidden {
 		t.Fatalf("allowed origin got 403")
+	}
+}
+
+// --- WebAuthn endpoint tests ---
+
+func fakeWebAuthnCredentialBlob(t *testing.T, id []byte) []byte {
+	t.Helper()
+	c := gowa.Credential{
+		ID:              id,
+		PublicKey:       []byte{0xa5, 0x01, 0x02, 0x03},
+		AttestationType: "none",
+	}
+	blob, err := json.Marshal(c)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	return blob
+}
+
+func TestWebAuthnRegisterBeginBootstrapAllowed(t *testing.T) {
+	rig := newRig(t)
+	c := rig.client(t)
+
+	// No credentials registered → bootstrap mode → register/begin should succeed.
+	resp, err := c.Post(rig.server.URL+"/auth/webauthn/register/begin", "application/json",
+		strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	body := decodeJSON(t, resp.Body)
+	if body["handle"] == nil || body["handle"] == "" {
+		t.Fatalf("missing handle: %v", body)
+	}
+	if body["options"] == nil {
+		t.Fatalf("missing options: %v", body)
+	}
+}
+
+func TestWebAuthnRegisterBeginRequiresAuthOnceCredentialExists(t *testing.T) {
+	rig := newRig(t)
+	// Provision a YubiKey so HasAnyCredential reports true.
+	rig.provisionAndProgram(t)
+
+	c := rig.client(t)
+	// No session → 401.
+	resp, err := c.Post(rig.server.URL+"/auth/webauthn/register/begin", "application/json",
+		strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", resp.StatusCode)
+	}
+
+	// Log in (authenticated session) → register/begin should succeed.
+	loginResp, err := c.Post(rig.server.URL+"/auth/yubikey/login", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loginResp.Body.Close()
+
+	resp2, err := c.Post(rig.server.URL+"/auth/webauthn/register/begin", "application/json",
+		strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("authed register/begin: status = %d, want 200", resp2.StatusCode)
+	}
+}
+
+func TestWebAuthnRegisterFinishRejectsBogusBody(t *testing.T) {
+	rig := newRig(t)
+	c := rig.client(t)
+
+	// Begin to get a valid handle.
+	beginResp, err := c.Post(rig.server.URL+"/auth/webauthn/register/begin", "application/json",
+		strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer beginResp.Body.Close()
+	begin := decodeJSON(t, beginResp.Body)
+
+	finishBody := map[string]any{
+		"handle":   begin["handle"],
+		"response": map[string]any{"id": "x", "rawId": "x"},
+	}
+	bodyBytes, _ := json.Marshal(finishBody)
+
+	resp, err := c.Post(rig.server.URL+"/auth/webauthn/register/finish", "application/json",
+		strings.NewReader(string(bodyBytes)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", resp.StatusCode)
+	}
+}
+
+func TestWebAuthnRegisterFinishRequiresHandleAndResponse(t *testing.T) {
+	rig := newRig(t)
+	c := rig.client(t)
+	for _, body := range []string{`{}`, `{"handle":""}`, `{"response":{}}`, `not-json`} {
+		resp, err := c.Post(rig.server.URL+"/auth/webauthn/register/finish", "application/json",
+			strings.NewReader(body))
+		if err != nil {
+			t.Errorf("body=%q: %v", body, err)
+			continue
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("body=%q: status = %d, want 400", body, resp.StatusCode)
+		}
+	}
+}
+
+func TestWebAuthnLoginBeginRejectsWithoutCredentials(t *testing.T) {
+	rig := newRig(t)
+	c := rig.client(t)
+	resp, err := c.Post(rig.server.URL+"/auth/webauthn/login/begin", "application/json",
+		strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", resp.StatusCode)
+	}
+}
+
+func TestWebAuthnLoginBeginAllowsWithRegisteredCredential(t *testing.T) {
+	rig := newRig(t)
+	// Inject a fake WebAuthn credential row directly.
+	_, err := rig.store.AddCredential(context.Background(), store.Credential{
+		Kind:           store.KindWebAuthn,
+		Label:          "fake",
+		CredentialID:   []byte("demo-cred"),
+		PublicMaterial: fakeWebAuthnCredentialBlob(t, []byte("demo-cred")),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c := rig.client(t)
+	resp, err := c.Post(rig.server.URL+"/auth/webauthn/login/begin", "application/json",
+		strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+}
+
+func TestWebAuthnLoginFinishRejectsBogusBody(t *testing.T) {
+	rig := newRig(t)
+	_, _ = rig.store.AddCredential(context.Background(), store.Credential{
+		Kind:           store.KindWebAuthn,
+		Label:          "fake",
+		CredentialID:   []byte("demo-cred"),
+		PublicMaterial: fakeWebAuthnCredentialBlob(t, []byte("demo-cred")),
+	})
+
+	c := rig.client(t)
+	beginResp, _ := c.Post(rig.server.URL+"/auth/webauthn/login/begin", "application/json",
+		strings.NewReader(`{}`))
+	begin := decodeJSON(t, beginResp.Body)
+	beginResp.Body.Close()
+
+	body := map[string]any{
+		"handle":   begin["handle"],
+		"response": map[string]any{"id": "x", "rawId": "x"},
+	}
+	bodyBytes, _ := json.Marshal(body)
+	resp, err := c.Post(rig.server.URL+"/auth/webauthn/login/finish", "application/json",
+		strings.NewReader(string(bodyBytes)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", resp.StatusCode)
 	}
 }
 

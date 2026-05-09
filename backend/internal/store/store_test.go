@@ -198,3 +198,117 @@ func TestMarkCredentialUsed(t *testing.T) {
 		t.Fatal("LastUsedAt was not updated")
 	}
 }
+
+func TestMetaSetGet(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	if _, err := s.MetaGet(ctx, "missing"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("expected sql.ErrNoRows, got %v", err)
+	}
+	if err := s.MetaSet(ctx, "k", []byte("v1")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.MetaGet(ctx, "k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "v1" {
+		t.Fatalf("got %q, want v1", got)
+	}
+	// Overwrite.
+	if err := s.MetaSet(ctx, "k", []byte("v2")); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = s.MetaGet(ctx, "k")
+	if string(got) != "v2" {
+		t.Fatalf("got %q, want v2", got)
+	}
+	// Empty key rejected.
+	if err := s.MetaSet(ctx, "", []byte("x")); err == nil {
+		t.Fatal("expected error for empty key")
+	}
+}
+
+func TestEnsureUserIDStable(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	a, err := s.EnsureUserID(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(a) != 16 {
+		t.Fatalf("user id length = %d, want 16", len(a))
+	}
+	b, err := s.EnsureUserID(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(a, b) {
+		t.Fatal("EnsureUserID returned a different value on second call")
+	}
+}
+
+func TestListCredentialsByKind(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	_, _ = s.AddCredential(ctx, Credential{Kind: KindYubiKeyHMAC, Label: "yk-1", PrivateBlob: []byte("a")})
+	_, _ = s.AddCredential(ctx, Credential{Kind: KindWebAuthn, Label: "wa-1", CredentialID: []byte("id1"), PublicMaterial: []byte("k1")})
+	_, _ = s.AddCredential(ctx, Credential{Kind: KindWebAuthn, Label: "wa-2", CredentialID: []byte("id2"), PublicMaterial: []byte("k2")})
+
+	wa, err := s.ListCredentialsByKind(ctx, KindWebAuthn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(wa) != 2 {
+		t.Fatalf("got %d webauthn rows, want 2", len(wa))
+	}
+	if wa[0].Label != "wa-1" || wa[1].Label != "wa-2" {
+		t.Fatalf("ordering wrong: %v", []string{wa[0].Label, wa[1].Label})
+	}
+
+	yk, _ := s.ListCredentialsByKind(ctx, KindYubiKeyHMAC)
+	if len(yk) != 1 {
+		t.Fatalf("got %d yk rows, want 1", len(yk))
+	}
+}
+
+func TestGetCredentialByID(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	id, _ := s.AddCredential(ctx, Credential{
+		Kind:           KindWebAuthn,
+		Label:          "wa",
+		CredentialID:   []byte("look-up-by-this"),
+		PublicMaterial: []byte("pubkey"),
+	})
+
+	c, err := s.GetCredentialByID(ctx, []byte("look-up-by-this"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.ID != id {
+		t.Fatalf("id = %d, want %d", c.ID, id)
+	}
+
+	if _, err := s.GetCredentialByID(ctx, []byte("nope")); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("expected sql.ErrNoRows, got %v", err)
+	}
+}
+
+func TestUpdateCredentialMaterial(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	id, _ := s.AddCredential(ctx, Credential{
+		Kind:           KindWebAuthn,
+		Label:          "wa",
+		CredentialID:   []byte("cid"),
+		PublicMaterial: []byte("v1"),
+	})
+	if err := s.UpdateCredentialMaterial(ctx, id, []byte("v2")); err != nil {
+		t.Fatal(err)
+	}
+	c, _ := s.GetCredentialByID(ctx, []byte("cid"))
+	if string(c.PublicMaterial) != "v2" {
+		t.Fatalf("public_material = %q, want v2", c.PublicMaterial)
+	}
+}
