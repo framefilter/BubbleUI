@@ -15,8 +15,12 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      '/ubus': 'http://127.0.0.1:8080',
-      '/auth': 'http://127.0.0.1:8080',
+      // bubble-authd defaults to :8765. /api/* and /auth/* both go there.
+      // /ubus will eventually point at uhttpd on the router; for dev it
+      // also routes through bubble-authd if/when a stub is added.
+      '/auth': 'http://127.0.0.1:8765',
+      '/api':  'http://127.0.0.1:8765',
+      '/ubus': 'http://127.0.0.1:8765',
     },
   },
 });

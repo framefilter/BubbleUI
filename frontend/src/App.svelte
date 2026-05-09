@@ -1,10 +1,12 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { currentPath, navigate, onChange } from './lib/router';
-  import { session, logout } from './lib/session.svelte';
+  import { session, logout, refresh } from './lib/session.svelte';
+  import * as api from './lib/api';
   import { ICON } from './lib/icons';
 
   import Login from './routes/Login.svelte';
+  import SetupNeeded from './routes/SetupNeeded.svelte';
   import Dashboard from './routes/Dashboard.svelte';
   import Wifi from './routes/Wifi.svelte';
   import Vpn from './routes/Vpn.svelte';
@@ -12,7 +14,17 @@
   import Dns from './routes/Dns.svelte';
 
   let path = $state(currentPath());
-  onMount(() => onChange((p) => (path = p)));
+
+  // Boot sequence:
+  //   1. POST our wall-clock to /api/time/sync so the router has correct
+  //      time before any TLS-dependent operation (DESIGN.md §6.6).
+  //   2. Fetch /auth/session/whoami to populate session state.
+  //   3. Subscribe to hash-route changes.
+  onMount(() => {
+    void api.timeSync(Date.now());
+    void refresh();
+    return onChange((p) => (path = p));
+  });
 
   const s = session();
 
@@ -30,18 +42,18 @@
   }
 </script>
 
-{#if !s.authenticated}
+{#if s.authenticated === undefined}
+  <div class="boot"><span class="icon spin">{ICON.refresh}</span> connecting…</div>
+{:else if s.setupNeeded}
+  <SetupNeeded />
+{:else if !s.authenticated}
   <Login />
 {:else}
   <div class="shell">
     <header>
       <div class="brand"><span class="icon">{ICON.router}</span> BubbleUI</div>
       <div class="status">
-        {#if s.hasKey}
-          <span class="pill ok"><span class="icon">{ICON.key}</span> key present</span>
-        {:else}
-          <span class="pill err"><span class="icon">{ICON.key}</span> no key</span>
-        {/if}
+        <span class="pill ok"><span class="icon">{ICON.key}</span> session #{s.credentialId}</span>
         <button onclick={logout} title="log out">{ICON.unlock}</button>
       </div>
     </header>
@@ -78,6 +90,17 @@
 {/if}
 
 <style>
+  .boot {
+    min-height: 100vh;
+    display: grid;
+    place-items: center;
+    color: var(--fg-dim);
+    font-size: 14px;
+    gap: 8px;
+  }
+  .spin { display: inline-block; animation: spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
   .shell {
     max-width: 720px;
     margin: 0 auto;

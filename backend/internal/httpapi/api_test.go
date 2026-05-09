@@ -457,6 +457,36 @@ func TestOriginCheckBlocksDisallowed(t *testing.T) {
 	}
 }
 
+func TestSetupStatusReflectsCredentialCount(t *testing.T) {
+	rig := newRig(t)
+	c := rig.client(t)
+
+	// Fresh device → has_credentials = false.
+	resp, err := c.Get(rig.server.URL + "/auth/setup-status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := decodeJSON(t, resp.Body)
+	resp.Body.Close()
+	if body["has_credentials"] != false {
+		t.Fatalf("fresh device: expected has_credentials=false, got %v", body)
+	}
+
+	// Provision a YubiKey credential.
+	rig.provisionAndProgram(t)
+
+	// Now → has_credentials = true.
+	resp2, err := c.Get(rig.server.URL + "/auth/setup-status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body = decodeJSON(t, resp2.Body)
+	resp2.Body.Close()
+	if body["has_credentials"] != true {
+		t.Fatalf("post-provision: expected has_credentials=true, got %v", body)
+	}
+}
+
 // --- WebAuthn endpoint tests ---
 
 func fakeWebAuthnCredentialBlob(t *testing.T, id []byte) []byte {

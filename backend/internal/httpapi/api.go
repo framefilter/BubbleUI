@@ -11,6 +11,7 @@
 //	POST /auth/recover                      — run §5.4 recovery
 //	GET  /auth/session/whoami               — current session, if any
 //	POST /auth/session/logout               — revoke the current session
+//	GET  /auth/setup-status                 — has-any-credential gate for the wizard
 //	POST /api/time/sync                     — browser-supplied time per §6.6
 //
 // Cookies: bubble-session, HttpOnly, SameSite=Strict, Secure (when TLS),
@@ -108,6 +109,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /auth/recover", s.handleRecover)
 	s.mux.HandleFunc("GET /auth/session/whoami", s.handleWhoami)
 	s.mux.HandleFunc("POST /auth/session/logout", s.handleLogout)
+	s.mux.HandleFunc("GET /auth/setup-status", s.handleSetupStatus)
 	s.mux.HandleFunc("POST /api/time/sync", s.handleTimeSync)
 }
 
@@ -277,6 +279,24 @@ func (s *Server) handleWhoami(w http.ResponseWriter, r *http.Request) {
 		"authenticated": true,
 		"credential_id": sess.CredentialID,
 		"expires_at":    sess.ExpiresAt.Unix(),
+	})
+}
+
+// handleSetupStatus returns whether the device has at least one
+// credential registered. The SPA uses this on first load to decide
+// between the wizard and the login screen. Reachable without auth
+// because there is no auth to gate it on when the device is fresh,
+// and the answer leaks nothing useful — anyone can probe an unprovisioned
+// device by simply trying to log in.
+func (s *Server) handleSetupStatus(w http.ResponseWriter, r *http.Request) {
+	has, err := s.cfg.Auth.HasAnyCredential(r.Context())
+	if err != nil {
+		s.logger.Error("HasAnyCredential", "err", err)
+		writeError(w, http.StatusInternalServerError, "internal")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"has_credentials": has,
 	})
 }
 

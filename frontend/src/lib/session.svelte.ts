@@ -1,35 +1,95 @@
-// Session state. M1 ships a fake login that accepts any non-empty password
-// and pretends a YubiKey was plugged in. Real flow lands in M2 (see
-// DESIGN.md §5).
+// Session state shared across the SPA. Backed by the real
+// /auth/session/whoami, /auth/yubikey/login, /auth/session/logout, and
+// /auth/recover endpoints exposed by bubble-authd.
+
+import * as api from './api';
 
 interface SessionState {
-  authenticated: boolean;
-  user: string | null;
-  hasKey: boolean;
+  // Tri-state: undefined while we haven't asked the server yet,
+  // otherwise the resolved authenticated/anonymous answer.
+  authenticated: boolean | undefined;
+  credentialId: number | null;
+  expiresAt: number | null;
+  // True if the device has zero credentials registered → wizard mode.
+  // Tri-state same as `authenticated`.
+  setupNeeded: boolean | undefined;
+  // Last error surfaced from a session-related call. Cleared on success.
+  lastError: string | null;
 }
 
-let state: SessionState = $state({
-  authenticated: false,
-  user: null,
-  hasKey: false,
+const state: SessionState = $state({
+  authenticated: undefined,
+  credentialId: null,
+  expiresAt: null,
+  setupNeeded: undefined,
+  lastError: null,
 });
 
 export function session(): SessionState {
   return state;
 }
 
-export async function login(password: string): Promise<{ ok: boolean; reason?: string }> {
-  if (!password) return { ok: false, reason: 'password required' };
-  await new Promise((r) => setTimeout(r, 200));
-  // M1 mock: pretend the router saw a YubiKey on USB and got a valid HMAC.
+// refresh hits whoami + setup-status and updates state in one shot.
+// Idempotent; safe to call any time.
+export async function refresh(): Promise<void> {
+  const [who, setup] = await Promise.all([api.whoami(), api.setupStatus()]);
+
+  if (!who.ok) {
+    state.authenticated = false;
+    state.credentialId = null;
+    state.expiresAt = null;
+    state.lastError = who.error.error;
+  } else if (who.data.authenticated) {
+    state.authenticated = true;
+    state.credentialId = who.data.credential_id;
+    state.expiresAt = who.data.expires_at;
+    state.lastError = null;
+  } else {
+    state.authenticated = false;
+    state.credentialId = null;
+    state.expiresAt = null;
+    state.lastError = null;
+  }
+
+  if (setup.ok) {
+    state.setupNeeded = !setup.data.has_credentials;
+  } else {
+    // Failure here is non-fatal — assume the device is provisioned and
+    // let the login screen surface the real error.
+    state.setupNeeded = false;
+  }
+}
+
+export async function loginYubiKey(): Promise<{ ok: boolean; reason?: string }> {
+  const r = await api.yubikeyLogin();
+  if (!r.ok) {
+    state.lastError = r.error.error;
+    return { ok: false, reason: r.error.error };
+  }
   state.authenticated = true;
-  state.user = 'admin';
-  state.hasKey = true;
+  state.credentialId = r.data.credential_id;
+  state.expiresAt = r.data.expires_at;
+  state.lastError = null;
   return { ok: true };
 }
 
-export function logout(): void {
+export async function recover(code: string): Promise<{ ok: boolean; reason?: string }> {
+  const r = await api.recover(code);
+  if (!r.ok) {
+    state.lastError = r.error.error;
+    return { ok: false, reason: r.error.error };
+  }
   state.authenticated = false;
-  state.user = null;
-  state.hasKey = false;
+  state.credentialId = null;
+  state.expiresAt = null;
+  state.lastError = null;
+  return { ok: true };
+}
+
+export async function logout(): Promise<void> {
+  await api.logout();
+  state.authenticated = false;
+  state.credentialId = null;
+  state.expiresAt = null;
+  state.lastError = null;
 }

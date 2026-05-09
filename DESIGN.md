@@ -513,12 +513,12 @@ Reasons, not tradeoffs:
 
 | | |
 |---|---|
-| Frontend bundle (HTML+JS+CSS+font) | < 400 KB target, ~200 KB realistic |
-| Each Go daemon, stripped | 3-6 MB |
-| Total BubbleUI install footprint | < 25 MB on flash |
+| Frontend bundle (HTML+JS+CSS+font) | < 400 KB target, ~85 KB realistic (current: 65 KB un-fonted) |
+| Each Go daemon, statically-linked stripped | 8-15 MB (current: `bubble-authd` 11 MB linux/arm64) |
+| Total BubbleUI install footprint | < 50 MB on flash (three Go daemons + frontend + configs) |
 | BubbleUI RAM at idle (all daemons) | < 50 MB |
 
-Leaves comfortable headroom for OpenWRT, dnsmasq, hostapd, wireguard tools, and trip configurations on a 128 MB / 512 MB device.
+Leaves comfortable headroom for OpenWRT, dnsmasq, hostapd, wireguard tools, and trip configurations on a 128 MB / 512 MB device. The original draft assumed each daemon would land at 3-6 MB; in practice `go-webauthn` pulls in TPM/COSE/CBOR machinery that brings `bubble-authd` to ~11 MB statically-linked. Trading binary size for "drop the file on the router and run, no shared-library hunt" is the right deal at this hardware tier.
 
 ### 13.4 Radio plan
 
