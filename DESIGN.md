@@ -139,14 +139,13 @@ A simple, security-conscious web UI for OpenWRT travel routers.
 
 - Scan visible SSIDs (`iwinfo`).
 - Configure `wwan` interface as a station; bring up `wlan0` as STA + `wlan1` as AP simultaneously where the radio supports it.
-- Captive-portal probe: HTTP GET to a hardcoded list of known endpoints (e.g. `http://detectportal.firefox.com/success.txt`). Mismatch → assume captive portal.
-- UI offers "Open hotel login" which iframes/redirects the user to the captive portal page; we never inject credentials.
+- Captive-portal detection and the firewall interaction it forces are the subject of §6.5; this section only handles the "scan, associate, get DHCP" mechanics.
 
 ### 6.2 WireGuard client + kill switch
 
 - Import config: paste `.conf`, scan QR, or upload file.
 - One-tap connect; status pill shows handshake age.
-- Kill switch: dedicated `wg` firewall zone with `forward=REJECT`, LAN zone forwards only to `wg`. When `wg0` is down, no LAN→WAN forwarding exists.
+- Kill switch: dedicated `wg` firewall zone with `forward=REJECT`, LAN zone forwards only to `wg`. When `wg0` is down, no LAN→WAN forwarding exists — with one narrow, time-boxed, user-consented exception during captive-portal sign-in (see §6.5).
 - DNS in the tunnel uses `Endpoint`-side DNS or our DoH resolver, never the hotel's.
 
 ### 6.3 Travel SSID with isolation
@@ -161,6 +160,57 @@ A simple, security-conscious web UI for OpenWRT travel routers.
 - Default to `https-dns-proxy` listening on 127.0.0.1:5053, dnsmasq forwards to it.
 - Default upstream: Quad9 (`9.9.9.9` / `dns.quad9.net`). User-pickable: Cloudflare, Mullvad, NextDNS, custom.
 - Firewall rule blocks outbound TCP/UDP 53 from LAN to anything except the local resolver. Prevents apps that hardcode `8.8.8.8`.
+
+### 6.5 Captive portal × kill switch
+
+§6.1 detects captive portals; §6.2 mandates that LAN→WAN forwarding is rejected whenever `wg0` is down. These contradict for one specific window: the user must clear the hotel portal *before* the tunnel can come up, but the kill switch is what blocks them from doing it.
+
+The v1.0 resolution is a tightly-scoped, explicitly user-consented bypass — GL.iNet's "auto-detect and let me sign in" UX, with the safeguards GL.iNet skips.
+
+#### Mechanism
+
+1. **Detect early.** Right after `wwan` gets DHCP, before any WG handshake attempt, probe a hardcoded list of connectivity-check URLs (`detectportal.firefox.com`, `connectivitycheck.gstatic.com`, plus our own probe). Capture redirect-target IPs from the probe responses. Honor RFC 8910 (DHCP option 114) when present — modern networks announce the portal URL directly.
+2. **Prompt explicitly.** UI shows a card with the detected portal target and a "Open sign-in window" button. Default state is closed; nothing opens silently. Cancel keeps the kill switch up.
+3. **Open a narrow firewall hole.** On consent, `bubble-netd` adds an nftables rule allowing `lan → wwan` to the captured portal IP set, on TCP 80/443 only. Comment-tagged for auditability. All other LAN→WAN traffic stays blocked.
+4. **Time-box.** 10-minute hard expiry, scheduled at rule creation. User can click "Close window now" to revoke early.
+5. **Provide DNS during the window.** A scoped dnsmasq instance forwards LAN queries to the hotel-pushed DNS server, *only* during the window. Strict TTLs, no caching past the window. Closes when the window closes.
+6. **Auto-close on success.** Background probe runs every 5 s through the open window. First probe success → drop firewall rule + DNS forwarder, bring up WG, status flips to "secured."
+7. **Re-captivity.** Hotels often re-prompt every 24 h or after idle. Background probes detect this; the tunnel goes down, kill switch re-engages, UI re-prompts. *No auto-reopen* — explicit user click each time.
+
+#### Visibility
+
+While the sign-in window is open, a persistent yellow banner is shown across **every** screen of the UI (not only the WiFi pane), with countdown:
+
+```
+⚠ Sign-in window open — 7m 32s remaining.
+   LAN→WAN allowed to 203.0.113.42 on TCP 80/443 only.   [ Close now ]
+```
+
+This is a security-relevant state; it must be impossible to forget about. Banner is also exposed via the LED on routers that have one (slow yellow blink).
+
+#### Strict mode
+
+Settings toggle: "Disable captive-portal sign-in window." When enabled, no firewall hole ever opens automatically. Captive portals must be cleared via a dedicated "Sign-in only" SSID (a future feature; documented as v1.x) or by manually disabling the kill switch for the duration. Default: off. Intended for trips where any LAN exposure is unacceptable.
+
+#### MAC stability
+
+WAN-side (STA) MAC defaults to **stable-per-SSID** (deterministic hash of SSID + per-trip salt), not OpenWRT's per-association randomization. Hotels remember our authorization across reboots within a trip; nothing carries across trips.
+
+#### Architectural seam
+
+The "where the user signs in" surface in `bubble-netd` is a pluggable interface. The v1.0 implementation routes the user's browser to the hotel portal via the firewall hole described above. A future `RouterProxySigningIn` implementation (v1.x exploration) could intercept the portal HTML server-side, rewrite links/forms to point back at BubbleUI, and execute the auth flow on the user's behalf — eliminating the LAN exposure window entirely. Detection logic, time-boxing, status surfacing, and auto-close are unchanged in either implementation.
+
+#### Decisions pinned
+
+- **Window duration:** 10 min default, user-configurable 1-30 min.
+- **Probe targets:** Firefox + Google + a self-hosted endpoint, so we're not single-vendor-dependent. Probe interval during open window: 5 s.
+- **MAC policy:** stable-per-SSID, not per-association randomized.
+- **Banner placement:** every screen, not just WiFi.
+- **Allowed ports during window:** TCP 80, 443 only. No DNS over UDP/53 to upstream — the scoped dnsmasq handles it locally.
+
+#### v1.x roadmap
+
+Router-as-portal-proxy: an HTML proxy that fetches and rewrites the portal page through BubbleUI's own UI, eliminating the LAN exposure window for the portals it can handle. Falls back to the v1.0 firewall-hole flow when the proxy can't handle a particular portal (JS-heavy SPAs, OAuth-style identity-provider redirects, etc.). Explicitly *not* a v1.0 commitment — explore if the v1.0 flow proves annoying on real trips.
 
 ## 7. Frontend
 
@@ -261,7 +311,7 @@ Anything else is denied. ACL files are versioned in this repo.
 - **M0 — this doc.** Design freeze, repo scaffold lands.
 - **M1 — frontend skeleton.** Svelte+Vite app with mock RPC, all screens stubbed, Nerd Font wired in.
 - **M2 — auth.** `bubble-authd` shell PoC against a real YubiKey on a Linux box (not router yet). Recovery code path tested.
-- **M3 — ubus wiring.** Run on a real OpenWRT device. Hotel WiFi + travel SSID screens functional.
+- **M3 — ubus wiring.** Run on a real OpenWRT device. Hotel WiFi (including the captive-portal sign-in flow per §6.5) + travel SSID screens functional.
 - **M4 — VPN + DNS.** WireGuard kill switch, DoH default. WG runs as a *pool of saved configs* with TCP-connect probing and `Connect to fastest` as the default action; auto fail-over to the next candidate on handshake failure. End-to-end on hardware.
 - **M5 — packaging.** `.ipk`, install docs, first tagged release (**v1.0**).
 - **M6+ — provider plugins.** ProtonVPN account login (SRP + dynamic WG provisioning), Cloudflare WARP fallback via `wgcf`, additional providers as community asks. Each one is a new source feeding the same pool + prober shipped in M4.
