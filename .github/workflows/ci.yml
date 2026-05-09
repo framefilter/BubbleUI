@@ -8,6 +8,14 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Opt into Node.js 24 for JavaScript-based actions. Node.js 20 is being
+# removed from GitHub-hosted runners on 2026-09-16; this flag silences
+# the deprecation warnings without waiting for action authors to publish
+# Node 24 builds. Drop once actions/checkout, actions/setup-node, etc.
+# default to Node 24.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   frontend:
     name: frontend
