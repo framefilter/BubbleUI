@@ -1,11 +1,12 @@
 name: package
 
-# Builds bubbleui_<arch>.ipk for each supported OpenWRT architecture.
+# Builds bubbleui packages (.apk on 25.x, .ipk on 24.10/23.05) for
+# each supported OpenWRT architecture.
 #
 # Triggered manually (workflow_dispatch) and on tag pushes — we don't
 # spin up the OpenWRT SDK on every commit, that's expensive and the
-# .ipk only matters at release time. The regular `ci` workflow stays
-# fast for everyday pushes.
+# package only matters at release time. The regular `ci` workflow
+# stays fast for everyday pushes.
 #
 # Outputs are uploaded as artifacts attached to the workflow run; the
 # release.yml workflow (later) will promote tagged builds to actual
@@ -19,15 +20,18 @@ on:
       openwrt_version:
         description: 'OpenWRT release to build SDK against'
         required: false
-        default: '24.10.6'
+        default: '25.12.3'
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-  # Track 24.10 — current stable line, AXT1800 territory. 23.05 still
-  # works in principle but the qualcommax target was reorganized in
-  # 24.x so SDK paths differ; we'd need per-version path tables to
-  # cover both. 25.x snapshots are deliberately out of scope.
-  OPENWRT_VERSION: ${{ github.event.inputs.openwrt_version || '24.10.6' }}
+  # Track 25.12 — current stable line. The AXT1800 has an official
+  # firmware build here under qualcommax/ipq60xx; 24.10 only ships it
+  # as a snapshot. 25.12 also switched the package format from .ipk
+  # to .apk (apk-tools replacing opkg), which the build/locate steps
+  # below handle. 23.05 still works in principle but the qualcommax
+  # target was reorganized between 23.05 and 25.12 so the SDK paths
+  # differ across versions; we don't try to cover the older line.
+  OPENWRT_VERSION: ${{ github.event.inputs.openwrt_version || '25.12.3' }}
 
 concurrency:
   group: package-${{ github.ref }}
@@ -41,17 +45,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # AXT1800, Beryl AX, etc.: aarch64_cortex-a53. In 24.10 the
-          # qualcommax target absorbed the old standalone ipq807x;
-          # qualcommax/ipq807x is the canonical 24.10 path for this
-          # arch. (qualcommax/ipq60xx — where the AXT1800 strictly
-          # belongs — is still snapshot-only, but the .ipk arch label
-          # matches so the package is install-compatible.)
-          - target: qualcommax-ipq807x
+          # AXT1800, Beryl AX, Marble: aarch64_cortex-a53. qualcommax/
+          # ipq60xx is the canonical 25.12 subtarget for IPQ60xx-class
+          # SoCs (which is what the AXT1800 runs).
+          - target: qualcommax-ipq60xx
             goos: linux
             goarch: arm64
             arch_label: aarch64_cortex-a53
-            sdk_url_path: targets/qualcommax/ipq807x
+            sdk_url_path: targets/qualcommax/ipq60xx
           # x86_64 generic — Protectli, mini-PCs, OpenWRT-on-VM.
           - target: x86-64
             goos: linux
@@ -161,28 +162,31 @@ jobs:
             BUBBLEUI_SRC=${{ github.workspace }} \
             BUBBLEUI_BIN=${{ github.workspace }}/bubbleui-bin
 
-      - name: Locate and stage .ipk
+      - name: Locate and stage package
         id: locate
         env:
           SDK: ${{ steps.sdk.outputs.sdk_dir }}
         run: |
           set -e
-          IPK=$(find "$SDK/bin/packages" -name 'bubbleui_*.ipk' -print -quit)
-          if [ -z "$IPK" ]; then
-            echo "::error::No bubbleui .ipk produced. Build artifacts:"
+          # 25.x emits .apk via apk-tools; 24.x and 23.x emit .ipk via
+          # opkg. Accept either; the BuildPackage macro picks the
+          # right one based on the SDK.
+          PKG=$(find "$SDK/bin/packages" \( -name 'bubbleui*.apk' -o -name 'bubbleui_*.ipk' \) -print -quit)
+          if [ -z "$PKG" ]; then
+            echo "::error::No bubbleui package produced. Build artifacts:"
             find "$SDK/bin/packages" -type f | head -30
             exit 1
           fi
-          echo "Built: $IPK"
+          echo "Built: $PKG"
           mkdir -p ${{ github.workspace }}/dist
-          cp "$IPK" ${{ github.workspace }}/dist/
+          cp "$PKG" ${{ github.workspace }}/dist/
           ls -la ${{ github.workspace }}/dist/
-          echo "ipk_path=${{ github.workspace }}/dist/$(basename "$IPK")" >> "$GITHUB_OUTPUT"
+          echo "pkg_path=${{ github.workspace }}/dist/$(basename "$PKG")" >> "$GITHUB_OUTPUT"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: bubbleui-${{ matrix.arch_label }}
-          path: ${{ steps.locate.outputs.ipk_path }}
+          path: ${{ steps.locate.outputs.pkg_path }}
           if-no-files-found: error
           retention-days: 30
