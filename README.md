@@ -53,14 +53,28 @@ What's wired today (testable on a Linux dev box, no router needed):
 
 ## Install (on a router)
 
-The shipping path is one OpenWRT `.ipk` per architecture, installed
-on top of vanilla OpenWRT 23.05+. See [`DESIGN.md` §10](./DESIGN.md#10-build--install)
-for the full rationale; the short version is:
+The shipping path is one OpenWRT package per architecture,
+installed on top of vanilla OpenWRT. 25.x emits `.apk` (apk-tools);
+24.10 and earlier emit `.ipk` (opkg). See
+[`DESIGN.md` §10](./DESIGN.md#10-build--install) for the full
+rationale; the short version, on **OpenWRT 25.12.x** (which is what
+the reference hardware ships with):
 
 ```sh
-# On the router:
+# Copy the .apk to /tmp first (e.g. scp from your workstation), then:
+apk update
+apk add --allow-untrusted /tmp/bubbleui-*.apk
+```
+
+`--allow-untrusted` is required because our CI builds are unsigned —
+that includes pre-built downloads from the Releases page. Signing is
+a post-1.0 item.
+
+On **OpenWRT 24.10.x or 23.05.x** with `opkg`:
+
+```sh
 opkg update
-opkg install /tmp/bubbleui_<arch>.ipk
+opkg install /tmp/bubbleui_*.ipk
 ```
 
 The package pulls `nginx-ssl`, `nftables`, `wireguard-tools`,
@@ -72,7 +86,7 @@ automatically via `/etc/uci-defaults/bubbleui`.
 Browse to `https://<router-ip>/`, accept the self-signed cert
 exception, and run through the [§6.7 wizard](./DESIGN.md#67-first-boot-wizard).
 
-`.ipk` artifacts are produced by the
+Package artifacts are produced by the
 [`package`](./.github/workflows/package.yml) workflow — currently
 on tag pushes and on-demand. Pre-built downloads will live on the
 GitHub Releases page once we tag a v0.1.
@@ -113,11 +127,11 @@ pnpm dev
 ├── README.md                — this
 ├── frontend/                — Svelte 5 + Vite SPA (see frontend/README.md)
 ├── backend/                 — Go module: four daemons + tests (see backend/README.md)
-├── package/bubbleui/        — OpenWRT .ipk skeleton (Makefile, init.d, UCI, nginx)
+├── package/bubbleui/        — OpenWRT package skeleton (Makefile, init.d, UCI, nginx)
 ├── scripts/dev.sh           — multi-daemon dev launcher
 ├── .github/workflows/
 │   ├── ci.yml               — push CI: tests, vet, gofmt, svelte-check, build
-│   └── package.yml          — tagged-release CI: build .ipk per arch
+│   └── package.yml          — tagged-release CI: build .apk/.ipk per arch
 └── .claude/                 — SessionStart hook for cloud dev sessions
 ```
 

@@ -69,11 +69,12 @@ endef
 
 define Package/bubbleui/conffiles
 /etc/config/bubbleui
-/etc/bubble/credentials.db
-/etc/bubble/vpn.db
-/etc/bubble/ui.pem
-/etc/bubble/ui.key
 endef
+
+# The cert/key and SQLite databases under /etc/bubble/ are runtime-
+# created (uci-defaults generates the cert pair; the daemons create
+# the DBs on first write), so they aren't package conffiles. They
+# survive upgrades because the package install doesn't ship over them.
 
 # No source fetch / unpack / compile — the binaries are pre-built.
 define Build/Prepare
