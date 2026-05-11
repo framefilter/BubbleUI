@@ -45,19 +45,31 @@ jobs:
           # qualcommax target absorbed the old standalone ipq807x;
           # qualcommax/ipq807x is the canonical 24.10 path for this
           # arch. (qualcommax/ipq60xx — where the AXT1800 strictly
-          # belongs — is still snapshot-only, but the .ipk arch label
-          # matches so the package is install-compatible.)
+          # belongs — first shipped stable images in 25.12; this 24.10
+          # build is still install-compatible via the matching arch
+          # label.)
           - target: qualcommax-ipq807x
             goos: linux
             goarch: arm64
             arch_label: aarch64_cortex-a53
             sdk_url_path: targets/qualcommax/ipq807x
+            openwrt_version: '24.10.6'
+          # Native AXT1800 / Beryl AX target. 25.x switched the package
+          # manager from opkg to apk, so this entry produces a .apk
+          # rather than a .ipk; the Locate step matches both.
+          - target: qualcommax-ipq60xx
+            goos: linux
+            goarch: arm64
+            arch_label: aarch64_cortex-a53
+            sdk_url_path: targets/qualcommax/ipq60xx
+            openwrt_version: '25.12.3'
           # x86_64 generic — Protectli, mini-PCs, OpenWRT-on-VM.
           - target: x86-64
             goos: linux
             goarch: amd64
             arch_label: x86_64
             sdk_url_path: targets/x86/64
+            openwrt_version: '24.10.6'
           # NOTE: no mipsle/mt7621 build. modernc.org/sqlite (and its
           # modernc.org/libc dependency) has no Go files for GOARCH=
           # mips/mipsle, so the CGO-free build chain we rely on can't
@@ -104,9 +116,15 @@ jobs:
 
       - name: Fetch OpenWRT SDK
         id: sdk
+        env:
+          # Per-matrix override beats the workflow_dispatch default —
+          # 25.12 is required for native ipq60xx, while ipq807x sticks
+          # to 24.10 (where its target path still exists).
+          MATRIX_OPENWRT_VERSION: ${{ matrix.openwrt_version }}
         run: |
           set -e
-          BASE="https://downloads.openwrt.org/releases/${OPENWRT_VERSION}/${{ matrix.sdk_url_path }}"
+          VERSION="${MATRIX_OPENWRT_VERSION:-${OPENWRT_VERSION}}"
+          BASE="https://downloads.openwrt.org/releases/${VERSION}/${{ matrix.sdk_url_path }}"
           # The SDK tarball name is <openwrt-sdk-VERSION-TARGET-...>.tar.{xz,zst}.
           # OpenWRT moved from xz to zst around 24.10; 23.05 still ships xz.
           # We grep the directory listing rather than guess the exact suffix.
@@ -161,28 +179,34 @@ jobs:
             BUBBLEUI_SRC=${{ github.workspace }} \
             BUBBLEUI_BIN=${{ github.workspace }}/bubbleui-bin
 
-      - name: Locate and stage .ipk
+      - name: Locate and stage package
         id: locate
         env:
           SDK: ${{ steps.sdk.outputs.sdk_dir }}
         run: |
           set -e
-          IPK=$(find "$SDK/bin/packages" -name 'bubbleui_*.ipk' -print -quit)
-          if [ -z "$IPK" ]; then
-            echo "::error::No bubbleui .ipk produced. Build artifacts:"
+          # 24.x produces .ipk (opkg), 25.x produces .apk (apk-tools);
+          # apk uses '-' as the name/version separator, ipk uses '_'.
+          PKG=$(find "$SDK/bin/packages" \
+            \( -name 'bubbleui_*.ipk' -o -name 'bubbleui-*.apk' \) \
+            -print -quit)
+          if [ -z "$PKG" ]; then
+            echo "::error::No bubbleui package produced. Build artifacts:"
             find "$SDK/bin/packages" -type f | head -30
             exit 1
           fi
-          echo "Built: $IPK"
+          echo "Built: $PKG"
           mkdir -p ${{ github.workspace }}/dist
-          cp "$IPK" ${{ github.workspace }}/dist/
+          cp "$PKG" ${{ github.workspace }}/dist/
           ls -la ${{ github.workspace }}/dist/
-          echo "ipk_path=${{ github.workspace }}/dist/$(basename "$IPK")" >> "$GITHUB_OUTPUT"
+          echo "pkg_path=${{ github.workspace }}/dist/$(basename "$PKG")" >> "$GITHUB_OUTPUT"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: bubbleui-${{ matrix.arch_label }}
-          path: ${{ steps.locate.outputs.ipk_path }}
+          # Two qualcommax entries share arch_label aarch64_cortex-a53,
+          # so include target+version in the name to avoid collision.
+          name: bubbleui-${{ matrix.target }}-${{ matrix.openwrt_version }}
+          path: ${{ steps.locate.outputs.pkg_path }}
           if-no-files-found: error
           retention-days: 30
