@@ -190,3 +190,136 @@ jobs:
           path: ${{ steps.locate.outputs.pkg_path }}
           if-no-files-found: error
           retention-days: 30
+
+  # Builds a flashable OpenWRT firmware image with BubbleUI and ALL its
+  # transitive dependencies preinstalled, using the OpenWRT Image
+  # Builder for the matching release. The whole point is to break the
+  # circular install problem: a privacy-conscious user with a freshly
+  # unboxed (or factory-reset) router can flash this single sysupgrade
+  # image and have a working BubbleUI on first boot — no SSH, no
+  # `apk update`, no WAN-must-be-online-first.
+  #
+  # We bake in only the AXT1800 image for now; it's the Tier-1
+  # reference hardware. Expanding the device matrix is a separate
+  # discussion (DESIGN.md §13 / §14).
+  image:
+    name: image (glinet_gl-axt1800)
+    runs-on: ubuntu-latest
+    needs: ipk
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download bubbleui package (aarch64_cortex-a53)
+        uses: actions/download-artifact@v4
+        with:
+          name: bubbleui-aarch64_cortex-a53
+          path: bubbleui-pkg
+
+      - name: Fetch OpenWRT Image Builder
+        id: ib
+        run: |
+          set -e
+          BASE="https://downloads.openwrt.org/releases/${OPENWRT_VERSION}/targets/qualcommax/ipq60xx"
+          # Same .xz/.zst auto-detect dance as the SDK step uses.
+          INDEX=$(curl -fsSL "$BASE/")
+          FILE=$(printf '%s' "$INDEX" | grep -oE 'openwrt-imagebuilder-[^"]+\.Linux-x86_64\.tar\.(xz|zst)' | head -n1)
+          if [ -z "$FILE" ]; then
+            echo "::error::could not find Image Builder tarball at $BASE"
+            exit 1
+          fi
+          echo "Downloading $BASE/$FILE"
+          curl -fsSLO "$BASE/$FILE"
+
+          mkdir -p "$HOME/imagebuilder"
+          case "$FILE" in
+            *.xz)  tar -xJf "$FILE" --strip-components=1 -C "$HOME/imagebuilder" ;;
+            *.zst) tar --use-compress-program=unzstd -xf "$FILE" --strip-components=1 -C "$HOME/imagebuilder" ;;
+          esac
+          echo "ib_dir=$HOME/imagebuilder" >> "$GITHUB_OUTPUT"
+
+      - name: Stage bubbleui .apk into Image Builder local packages
+        env:
+          IB: ${{ steps.ib.outputs.ib_dir }}
+        run: |
+          set -e
+          # In 25.x Image Builder, files dropped into packages/ are
+          # picked up as a local repo; `make image` indexes them before
+          # resolving PACKAGES. Transitive deps of bubbleui (nginx-ssl,
+          # nftables, wireguard-tools, dnsmasq-full, https-dns-proxy,
+          # yubikey-personalization, ca-bundle, px5g-mbedtls — see
+          # package/bubbleui/Makefile) come from the upstream 25.12.3
+          # feed, also indexed automatically by Image Builder.
+          mkdir -p "$IB/packages"
+          cp bubbleui-pkg/bubbleui-*.apk "$IB/packages/"
+          ls -la "$IB/packages/"
+
+      - name: Build firmware image
+        env:
+          IB: ${{ steps.ib.outputs.ib_dir }}
+        run: |
+          set -e
+          cd "$IB"
+          # PROFILE pins the exact device (AXT1800). PACKAGES adds
+          # bubbleui on top of the profile's defaults; Image Builder
+          # resolves and bakes all dependencies into the rootfs, so
+          # the resulting sysupgrade.bin is fully self-contained.
+          make image \
+            PROFILE=glinet_gl-axt1800 \
+            PACKAGES="bubbleui" \
+            -j$(nproc)
+          ls -la bin/targets/qualcommax/ipq60xx/
+
+      - name: Stage images, manifest, and generate FIRMWARE-CONTENTS.md
+        env:
+          IB: ${{ steps.ib.outputs.ib_dir }}
+        run: |
+          set -e
+          OUT="$IB/bin/targets/qualcommax/ipq60xx"
+          DEST="${{ github.workspace }}/dist-image"
+          mkdir -p "$DEST"
+
+          # sysupgrade.bin is mandatory; factory image may or may not
+          # exist depending on the profile; manifest is mandatory and
+          # is our authoritative "what's actually inside" list.
+          cp "$OUT"/openwrt-*-glinet_gl-axt1800-squashfs-sysupgrade.bin "$DEST/"
+          cp "$OUT"/openwrt-*-glinet_gl-axt1800-squashfs-factory.* "$DEST/" 2>/dev/null || true
+          cp "$OUT"/*glinet_gl-axt1800*.manifest "$DEST/"
+
+          MANIFEST=$(ls "$DEST"/*.manifest | head -n1)
+          if [ -z "$MANIFEST" ] || [ ! -s "$MANIFEST" ]; then
+            echo "::error::manifest missing or empty — cannot generate FIRMWARE-CONTENTS.md"
+            exit 1
+          fi
+
+          # Manifest is `pkgname version` per line. Render as a sorted
+          # markdown table so we can link to it from user-facing docs
+          # later and decide what's safe to strip for a smaller image.
+          {
+            echo "# Firmware contents"
+            echo
+            echo "Device: **GL.iNet GL-AXT1800** (\`glinet_gl-axt1800\`, qualcommax/ipq60xx, aarch64_cortex-a53)"
+            echo "OpenWRT: **${OPENWRT_VERSION}**"
+            echo "Built: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo
+            echo "Authoritative list of every package baked into the rootfs of this"
+            echo "firmware, generated from the OpenWRT Image Builder manifest. This"
+            echo "includes BubbleUI's transitive dependencies — no \`apk update\` and"
+            echo "no internet are required on first boot for BubbleUI to function."
+            echo
+            echo "| Package | Version |"
+            echo "|---------|---------|"
+            awk 'NF>=2 { printf "| %s | %s |\n", $1, $2 }' "$MANIFEST" | sort
+          } > "$DEST/FIRMWARE-CONTENTS.md"
+
+          echo "----- staged firmware artifacts -----"
+          ls -la "$DEST/"
+          echo "----- FIRMWARE-CONTENTS.md head -----"
+          head -30 "$DEST/FIRMWARE-CONTENTS.md"
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bubbleui-firmware-glinet_gl-axt1800-${{ env.OPENWRT_VERSION }}
+          path: dist-image/
+          if-no-files-found: error
+          retention-days: 30
