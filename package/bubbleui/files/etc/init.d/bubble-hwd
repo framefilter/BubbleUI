@@ -12,10 +12,9 @@ start_service() {
 	. /lib/functions.sh
 	config_load bubbleui
 
-	local listen led_name auth_health vpn_status net_signin compose_interval
+	local listen led_name vpn_status net_signin compose_interval
 	config_get listen           server hw_listen         '127.0.0.1:8768'
 	config_get led_name         server led_name          ''
-	config_get auth_health      server auth_health_url   'http://127.0.0.1:8765/auth/health'
 	config_get vpn_status       server vpn_status_url    'http://127.0.0.1:8766/vpn/status'
 	config_get net_signin       server net_signin_url    'http://127.0.0.1:8767/net/signin/status'
 	config_get compose_interval server compose_interval  '5s'
@@ -25,7 +24,6 @@ start_service() {
 		-listen "$listen" \
 		-vpn-status "$vpn_status" \
 		-net-signin "$net_signin" \
-		-auth-health "$auth_health" \
 		-compose-interval "$compose_interval"
 	[ -n "$led_name" ] && procd_append_param command -led "$led_name"
 

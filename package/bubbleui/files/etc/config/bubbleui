@@ -25,7 +25,6 @@ config server 'server'
 	# bubble-hwd
 	option hw_listen         '127.0.0.1:8768'
 	option compose_interval  '5s'
-	option auth_health_url   'http://127.0.0.1:8765/auth/health'
 	option vpn_status_url    'http://127.0.0.1:8766/vpn/status'
 	option net_signin_url    'http://127.0.0.1:8767/net/signin/status'
 	# Leave led_name empty for auto-detect via UCI (DESIGN §14) +

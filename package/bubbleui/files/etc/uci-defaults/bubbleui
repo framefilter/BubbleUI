@@ -14,9 +14,15 @@
 set -e
 
 # 1. Self-signed cert with broad validity (DESIGN §6.6). px5g is
-# OpenWRT's tiny TLS toolchain and is preferred over openssl on
-# small-flash devices. The fallback path covers x86 builds where
-# px5g is sometimes excluded.
+# OpenWRT's tiny TLS toolchain. We use ECDSA P-256 rather than RSA:
+# px5g-mbedtls in OpenWRT 25.12.x silently ignores `-bits` for RSA
+# and tries a 512-bit modulus that mbedtls 3.x refuses outright, so
+# `selfsigned -type rsa -bits 2048` exits non-zero with "key
+# generation failed" on a stock 25.12 install. P-256 is well-formed
+# in px5g, mbedtls accepts it, and every modern browser handles it.
+# RSA fallback could be revisited once px5g-mbedtls is fixed
+# upstream; the openssl fallback covers builds where px5g isn't
+# available (x86, mostly).
 mkdir -p /etc/bubble
 chmod 0700 /etc/bubble
 
@@ -24,13 +30,13 @@ if [ ! -f /etc/bubble/ui.pem ] || [ ! -f /etc/bubble/ui.key ]; then
 	HOSTNAME=$(uci -q get bubbleui.ui.hostname || echo bubble.local)
 
 	if command -v px5g >/dev/null 2>&1; then
-		px5g selfsigned -type rsa -bits 2048 \
+		px5g selfsigned -type ec -curve prime256v1 \
 			-keyout /etc/bubble/ui.key \
 			-out    /etc/bubble/ui.pem \
 			-days   28000 \
 			-subj   "/CN=${HOSTNAME}"
 	elif command -v openssl >/dev/null 2>&1; then
-		openssl req -x509 -newkey rsa:2048 -nodes \
+		openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
 			-keyout /etc/bubble/ui.key \
 			-out    /etc/bubble/ui.pem \
 			-days   28000 \
