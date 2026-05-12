@@ -603,12 +603,27 @@ fixups.
 
 ### 10.4 Pre-built images
 
-Reserved for Tier-1 hardware only, opt-in per device, and not in
-v1.0 scope. See §13 — the project boundary is "package on top of
-OpenWRT," not "OpenWRT distribution." If carrying around a
-particular device gets annoying enough, we'd build an ImageBuilder
-profile that bakes the .ipk into a flashable firmware image, but
-that decision is per-device and per-need.
+**Position: the long-term goal is no pre-built images.** The project boundary is "package on top of vanilla OpenWRT," not "OpenWRT distribution" (§13.4). Maintaining a per-device, per-version image matrix — release engineering, signing keys, OTA infra, vendor-specific factory-image variants — is the kind of work that turns a focused package into a distribution, and that is explicitly not what BubbleUI is.
+
+**Where we are right now: testing-phase scaffold only.** During the pre-community phase of the project (no UI yet to show the open-source world, no community feedback on the install story), the package workflow does produce one pre-built `sysupgrade.bin`:
+
+- **AXT1800 only** (`qualcommax/ipq60xx` / `glinet_gl-axt1800`), the Tier-1 reference device (§13.2).
+- **One OpenWRT release at a time** — tracks whatever `OPENWRT_VERSION` `.github/workflows/package.yml` defaults to (currently 25.12.3). When upstream bumps, we bump; we don't keep a back-catalog.
+- Built by the same `package` workflow that produces the `.apk`, using the matching OpenWRT Image Builder with the BubbleUI `.apk` dropped into its local feed so all transitive deps are baked into the rootfs.
+- Ships alongside the `.apk` as the artifact `bubbleui-firmware-glinet_gl-axt1800-<version>` for the maintainer and early testers to try the product on real hardware without doing a full SDK build themselves.
+
+This artifact exists because the audience (low-to-middling tech ability; see Goals) can't bootstrap a stock OpenWRT install plus `apk add bubbleui` themselves, and we don't yet have the community input to design the eventual install path. It is a deliberately narrow stopgap — one device, one OpenWRT release, no signing infrastructure, no OTA, no release channels.
+
+**What this is not.** We do not ship per-device builds. We do not promise to add devices to the image matrix on request. We do not commit to a release cadence for the pre-built image. If a Tier-2 user wants their device to "just work" the same way, the answer is the same as for any other capable user on any other Tier-2 device: build the package from the SDK and `apk add` it (§10.3). Expanding the pre-built matrix is opposite to the goal; we will say no.
+
+**What replaces it eventually.** Undecided, and deliberately so. The candidates we expect to weigh once there is a working UI to put in front of the community:
+
+- A one-command Image Builder recipe the user runs locally (covers any vanilla-OpenWRT-supported device without a CI matrix on our side).
+- A sysupgrade-from-running-OpenWRT path that doesn't require flashing at all.
+- Community-curated per-vendor recipes, kept outside this repo.
+- Something the community surfaces that we haven't thought of.
+
+Picking among these is work that follows showing the UI to the community, not work that precedes it.
 
 ## 11. Open questions
 
