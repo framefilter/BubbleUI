@@ -368,6 +368,104 @@ Anything skipped in the wizard is reachable from the regular UI. The wizard is a
 
 Default `dropbear` configured with `PasswordAuth no`, `RootLogin no`, key-based only. If `dropbear` proves to lag on `sk-*` key support, swap to `openssh-server` (~1 MB extra footprint). Decision deferred to M2 testing on real hardware.
 
+### 6.8 Roaming uplink recovery (no-upstream captive portal)
+
+After the first-boot wizard (§6.7) has run, the router is configured but mobile — the user takes it to hotels, cafés, friends' houses. Each new venue is a "no remembered AP in range" situation. Asking the audience (low-to-middling tech ability; see project intent) to SSH in or remember an admin password just to point the router at a new wifi defeats the product. §6.8 covers what happens instead: when the router has no working upstream, BubbleUI presents an **unauthenticated** wifi-join page to any device on its LAN, surfaced via the OS-native captive-portal mechanism.
+
+This is distinct from §6.5 (kill-switch's interaction with a hotel's own captive portal — router-as-client) and §6.7 (the first-boot wizard, which is a one-time superset of this UX). §6.8 is the steady-state "router has no internet and needs help getting some" flow.
+
+#### State machine
+
+A new daemon `bubble-bootstrapd` owns the state. Four states:
+
+- **CONNECTED.** WAN has a route to the internet (verified via the connectivity probe described below). All API auth is enforced; bootstrap unauth endpoints 401.
+- **NO_UPSTREAM.** No working WAN AND no remembered AP visible in the last successful scan. nftables redirects LAN HTTP egress to the BubbleUI nginx vhost; dnsmasq serves wildcard answers (LAN IP) including for the captive-portal probe domains; the three bootstrap endpoints below answer without auth.
+- **JOINING.** User submitted a join via the bootstrap UI; daemon is reconfiguring wpa_supplicant via `bubble-netd` and waiting for IP + connectivity. Same redirect/dnsmasq/auth posture as NO_UPSTREAM until JOINING resolves either way.
+- **STALE_RESCAN.** Scan call failed (driver/firmware blip — known intermittent on the AXT1800's ath11k). Stay open, mark the scan list as stale in `/api/bootstrap/status`, retry on a backoff. Does *not* bounce to CONNECTED, since "we couldn't scan" is not "we're online".
+
+Entry: `CONNECTED → NO_UPSTREAM` when the connectivity probe has failed for ≥30s AND a fresh scan returns zero overlap with the saved-networks set. The 30s debounce keeps a quick WAN flap (cable bump, brief AP roam) from bouncing the LAN into captive-portal mode.
+
+Exit: `NO_UPSTREAM | JOINING → CONNECTED` when the connectivity probe succeeds. The probe is described below — we deliberately don't trust the OS captive-portal probe domains here because an AP we just joined could intercept them, and "OS thinks we're online" is the wrong signal for "we, the router, are actually online".
+
+NO_UPSTREAM is a *transient operational state*, not a persistent privileged mode. Factory-reset is a separate, deliberately heavier path (button-hold; documented elsewhere when we get to §13.x).
+
+#### What the user sees
+
+1. Phone connects to BubbleUI's wifi using the WPA2/3 password printed on the device label (per §6.5 travel-SSID model). This is the only credential required at this stage.
+2. iOS / Android / macOS / Windows / Chrome OS each run their captive-portal probe on association. With `bubble-bootstrapd` in NO_UPSTREAM, those probes get intercepted (dnsmasq + nftables); the OS classifies the network as "captive" and pops the standard "Sign in to network" notification.
+3. Tapping the notification opens the OS captive web-view to BubbleUI's `/bootstrap` page (HTTP, the router's LAN IP — `192.168.8.1` per §6.6). No certificate prompts, because we don't try to MITM TLS.
+4. The page shows: a live scan list (SSID, signal bars, security type, ★ for remembered), a "join other network" form (for hidden SSIDs), and a status indicator. No admin surface. No login.
+5. User picks an AP, enters the password if needed, taps Join.
+6. Page polls `/api/bootstrap/status`; on success it shows "connected — continue to BubbleUI" linking to the authenticated UI at `https://bubble.lan` (or whatever §6.6 nails down). On failure, it returns to the scan list with a reason ("wrong password", "AP disappeared", "DHCP timeout").
+
+The crucial property: a fresh-out-of-the-airport user holding their phone never sees a login screen. They see wifi options and they pick one.
+
+#### Unauth surface — explicit allowlist
+
+The unauthenticated API surface in NO_UPSTREAM / JOINING is exactly three endpoints. Everything else 401s in every state. The auth middleware checks state to *skip* auth on these three; it does **not** elevate any other endpoint's privileges or expose any new ones.
+
+- `GET /api/bootstrap/scan` — channel, SSID, RSSI, security mode, `remembered: bool`. Same fields `iwinfo scan` already exposes to anyone with physical proximity; no new leak.
+- `POST /api/bootstrap/join` — body `{ssid, security, key?}`. Returns `{join_id}`. Body is opaque to the daemon beyond passing it to `bubble-netd`'s scan-and-join helper (single source of truth shared with §6.7 step 6).
+- `GET /api/bootstrap/status` — `{state, last_scan_age, active_join?: {id, progress, error?}}`.
+
+What these endpoints CANNOT do (defense in depth — the daemon refuses, not just the middleware):
+
+- Touch firewall rules outside the `bubbleui_bootstrap` named chain.
+- Read or write any credential, recovery code, or session.
+- Read or write VPN configs, DNS settings, MAC privacy settings, hostname.
+- Read system logs, config files outside the wpa_supplicant ssid+psk it's writing.
+- Trigger reboot, sysupgrade, or any sysctl change.
+
+#### Threat surface and the button-press hardening
+
+Active threat in NO_UPSTREAM: a person on the LAN — meaning someone who has the device's WPA2/3 password — can initiate a join to an AP they control, redirecting the router's uplink. The product's §3 threat model already excludes attackers with physical access to the device, so the realistic case is "someone the user gave wifi access to, acting maliciously while the router is in a transient no-upstream state". Narrow.
+
+Two things keep this narrow rather than wide:
+
+- The factory wifi password is unique per device (printed on the label). Default deployment is not an open wifi.
+- The post-join uplink goes through every normal BubbleUI control plane on transition back to CONNECTED — VPN kill-switch re-arms, encrypted DNS re-engages, the captive-portal-x-killswitch flow (§6.5) intercepts any hotel portal. A malicious uplink doesn't bypass any of that; it just gets the user back to a state where the rest of the product is doing its job.
+
+For users whose threat model includes "someone I gave wifi access to may try to attack me on the LAN":
+
+**Settings → Security → "Require physical button press for wifi-join in roaming mode."** *(off by default)*
+
+When on, `POST /api/bootstrap/join` returns `409 button_press_required` and the daemon arms a 30s window. The user must press the AXT1800's hardware button (mapped via §14's quirks registry — the reset button is the default GPIO; the side switch is also exposed and configurable). LED behavior during the window follows §13.7's "awaiting confirmation" pattern: distinct, not the same blink as boot or activity.
+
+Off by default because adding a physical step is friction the audience can absorb at first-boot (they're holding the device anyway) but not necessarily at "I just sat down at a coffee shop." The toggle is for users who deliberately want the friction.
+
+#### Connectivity probe
+
+The probe is the signal that drives CONNECTED ↔ NO_UPSTREAM. Three properties we want:
+
+- Doesn't lie when the local AP intercepts well-known captive-portal domains.
+- Doesn't make BubbleUI a notable third-party-request source for big-tech telemetry surfaces.
+- Survives the third-party host going away.
+
+Compromise for M3: HTTPS GET to `https://detectportal.firefox.com/success.txt` with cert pinning to Mozilla's known CA chain, 5s timeout, expect literal `success` body. Mozilla has the least-bad privacy posture of the OS-probe operators. The pin means an MITM upstream can't fake "we're online". Failure modes (cert mismatch, body mismatch, timeout, DNS NXDOMAIN) all map to "not connected".
+
+This is a deferred decision per §11.x — see entry added there. A self-hosted probe URL would be ideal but means we operate infra and that infra becomes a privacy-sensitive request log. Multi-probe-with-quorum is the likely landing spot; M3 ships single-probe-with-pin.
+
+#### Interaction with other features
+
+- **§5 Authentication.** §6.8 is the *only* state where any endpoint bypasses auth, and the bypass is endpoint-allowlisted, not blanket. The decision to be unauth here is justified by "the user hasn't yet had the chance to authenticate at this venue's network reachability, so requiring it is a deadlock," not by convenience.
+- **§6.2 VPN kill-switch.** Suspended in NO_UPSTREAM and JOINING — there's no upstream to kill-switch, and clients in NO_UPSTREAM need DNS reachable to the captive-portal page. Re-armed atomically on the CONNECTED transition (before the nftables redirect rules come down, so clients can't briefly route outside the tunnel).
+- **§6.4 Encrypted DNS.** Disabled in NO_UPSTREAM (no upstream resolver reachable). dnsmasq answers locally. Re-enabled on CONNECTED.
+- **§6.5 Captive portal × kill-switch.** Distinct flow. §6.5 fires *after* §6.8 has joined an upstream that itself has a captive portal. Order: §6.8 gets the L2/L3 association, then §6.5 carves the portal-clearance hole, then normal kill-switched routing resumes.
+- **§6.7 First-boot wizard.** Strict ordering: if the wizard has not completed (setup-state in `/etc/bubble/setup-state.json` is non-empty), `bubble-bootstrapd` does not enter NO_UPSTREAM regardless of network state — the wizard's setup mode is already a superset of bootstrap (it includes wifi-join in step 6) plus the credential ceremony. NO_UPSTREAM is only ever entered after setup-mode has exited.
+- **§14 Hardware abstraction.** The button-press hardening uses §14's quirks registry to know which GPIO is the user-configurable button on this device. Defaults to "reset" on AXT1800; configurable per device.
+
+#### Implementation sketch
+
+- **New daemon: `bubble-bootstrapd`** (Go, ~300 LOC estimated). Owns the state machine. Inputs: `network.interface` ubus events, periodic `iwinfo scan` results via `bubble-netd`, connectivity probe goroutine, button-press events from `bubble-hwd`. Outputs: state file (`/var/run/bubble/bootstrap-state`), nftables ruleset transitions, dnsmasq conf-snippet swaps, the three `/api/bootstrap/*` endpoints.
+- **nftables.** A named chain `bubbleui_bootstrap` is flushed and rebuilt atomically on state transitions. In NO_UPSTREAM / JOINING: DNAT TCP 80 from LAN to the BubbleUI nginx vhost on `192.168.8.1`; drop or REJECT TCP 443 from LAN (forces the OS into captive-mode rather than producing cert errors); no NAT on UDP 53 because dnsmasq already binds it.
+- **dnsmasq.** Two named conf snippets, both shipped in the package: `bootstrap-on.conf` (wildcard `address=/#/192.168.8.1`) and `bootstrap-off.conf` (empty). The daemon `mv`s into `/tmp/dnsmasq.d/bootstrap.conf` and SIGHUPs dnsmasq on transition.
+- **Frontend.** New `/bootstrap` route in the Svelte app, no auth guard. Reuses the scan-list and join-form components built for §6.7 step 6 — single set of components, two entry points.
+- **`bubble-netd`.** Gains a `Bootstrap` ubus method exposing scan + join helpers, gated to only respond to `bubble-bootstrapd` (peer cred check on the ubus socket). The wizard and the bootstrap daemon both go through this method, so the wifi-join logic lives in exactly one place.
+
+#### Open question (added to §11)
+
+The connectivity probe URL — see §11.7.
+
 ## 7. Frontend
 
 ### 7.1 Stack
@@ -527,6 +625,12 @@ that decision is per-device and per-need.
    - **Time-based rotation** *(opt-in)*. Rotate all interface MACs — WAN-side STA, travel-SSID AP, LAN — on a user-configurable cadence. Pre-canned presets: 24h (the Apple iOS Private Wi-Fi Address default), 7d, 30d. Custom interval allowed. Rotation fires on a tick boundary, not mid-association — an active connection survives until the next reconnect. Stable-per-SSID remains the default; time-based stacks on top.
    - **OUI picker** *(opt-in)*. Replace locally-administered random MACs (first byte `0x02`/`0x06`/`0x0a`/`0x0e`, which some networks treat as suspicious) with a vendor OUI of the user's choice. Curated list bundled in firmware (Apple, Samsung, Intel, etc.); first three bytes fixed, last three randomized per rotation.
    - **Hostname privacy** *(default-on)*. The default hostname is *never* `OpenWrt`. Wizard picks a neutral default at setup, or one that pattern-matches the selected OUI (`iPhone` for an Apple OUI, `Galaxy` for Samsung, etc.). User can override with any string at any time. The DHCP client identifier and mDNS broadcasts share the hostname, so this single setting covers all the obvious leak points.
+
+7. **Connectivity probe target for §6.8.** The state machine in §6.8 needs a signal for "the router itself is actually online" — distinct from "the OS captive-portal probe domains say we're online," since an AP we just associated to could be lying about those. Tradeoffs:
+   - **Use one of the OS-standard probe domains** (Apple/Google/Microsoft/Mozilla). Convenient, well-tested, but adds the project to a big-tech request log every state-check tick — at odds with the threat model in §3.
+   - **Self-host a probe URL** (`probe.bubbleui.dev` or similar). Privacy-clean from the user's side but means we operate infra and that infra's request log becomes privacy-sensitive to us-as-maintainers; also a single point of failure.
+   - **Multi-probe quorum.** Hit 2-of-3 unrelated hosts (e.g. Mozilla + Quad9 + a self-hosted), succeed if any succeed, with cert pinning on each. Best privacy properties, more code.
+   - **Decision for M3:** single-probe with cert pin to `https://detectportal.firefox.com/success.txt` as a deliberate placeholder. Mozilla has the least-bad privacy posture of the OS-probe operators, the success.txt response is trivially verifiable, and the pin foils mid-flight tampering. Revisit before v1.0 — quorum is the likely landing spot.
 
 ## 12. Milestones
 
