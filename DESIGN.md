@@ -163,10 +163,61 @@ Recovery codes are stored as BLAKE2s hashes only; the plaintext is shown to the 
 
 ### 6.3 Travel SSID with isolation
 
-- Per-trip SSID name + WPA2/3-SAE password (default WPA3-SAE, fallback mixed).
+- Per-trip SSID name and password.
 - `isolate=1` on the AP by default.
 - Optional guest VLAN with its own DHCP scope and zero LAN access.
 - "Forget this trip" wipes the SSID, password, leases, and ARP cache.
+
+Wifi security defaults are the subject of the next subsection and apply
+to **every** BubbleUI-managed AP — the Travel SSID, the factory SSID
+used at first boot, and any future "guest" / "kids" / IoT SSID the
+product grows. The audience (privacy-conscious, low-to-middling tech
+ability) should not be expected to reason about cipher suites or roll
+their own posture; the defaults need to be right out of the box.
+
+### 6.3a Wifi security posture (BubbleUI-as-AP)
+
+#### Allowed encryption modes
+
+| Mode | UCI `encryption` | Default? | Notes |
+|---|---|---|---|
+| **WPA3-Personal (SAE)** | `sae` | **Yes** | Default for every new SSID. Mandates PMF=required. |
+| **WPA3/WPA2 transition** | `sae-mixed` | Opt-in | "Compatibility mode." Same SSID accepts both SAE and PSK clients. PMF=optional. Use only when a needed client (older Android, legacy laptops, kids' tablets) cannot do WPA3. |
+| **WPA2-Personal (PSK, AES-CCMP)** | `psk2+ccmp` | Opt-in | Only for SSIDs the user explicitly downgrades. PMF exposed as a separate UI toggle (`ieee80211w`: 0/1/2). |
+
+The UI surfaces these as three radio buttons per SSID, with WPA3-SAE pre-selected. The transition-mode option warns inline that it widens the downgrade surface; the WPA2-only option warns more strongly and asks for an explicit confirm.
+
+#### Refused outright (no UI affordance, no UCI plumbing exposed)
+
+- **WPS** in any form (`wps_pushbutton`, `wps_label`, AP PIN). The WPS PIN protocol is broken (Reaver, Pixie Dust) and the push-button variant adds a 2-minute window where any nearby station can register. There is no path to enable it from the UI.
+- **WEP** in any form (`wep-open`, `wep-shared`, `wep+open+shared`). Trivially recovered key. The UI never lists it; the daemon refuses to write it even if a config import tries.
+- **Open** SSIDs (`none`). Not a default. A future "captive guest hotspot" use case might justify a flag-gated escape hatch — that's a separate design conversation, not v1.0.
+- **WPA1 / TKIP** (`psk`, `psk+tkip`, `psk-mixed+tkip`). Deprecated; chosen-plaintext + MIC attacks on TKIP are practical. Same refusal posture as WEP.
+
+#### Protected Management Frames (PMF / 802.11w)
+
+PMF protects deauth/disassoc/action frames against forgery — without it, anyone in range can knock clients off the AP with a single broadcast frame. PMF semantics by mode:
+
+- **WPA3-SAE:** PMF is *required* by the WPA3 spec. We pin `ieee80211w=2`. Not a toggle.
+- **WPA3/WPA2 transition (`sae-mixed`):** PMF defaults to *required* but downgrades to optional per-client at association time, so legacy clients still associate. We pin `ieee80211w=1` and document this as an inherent property of transition mode — if a user can't tolerate it, they should pick WPA2-only and turn PMF on explicitly.
+- **WPA2-Personal:** PMF is *optional* in the standard. Where the OpenWRT build supports it (it does on 25.12.x with `wpad-basic-mbedtls` and on `wpad-mesh-mbedtls`), the UI exposes a per-SSID toggle (`ieee80211w`: 0 disabled / 1 optional / 2 required). Default for new WPA2-only SSIDs is `1` (optional) so legacy clients still associate, with the UI nudging "consider Required" inline.
+
+The driver/firmware on the AXT1800 (ath11k, ipq60xx) supports PMF in all three modes; older targets may not. The hardware abstraction in §14's quirks registry surfaces a `pmf_supported: bool` per radio so the UI can hide the toggle on devices that genuinely can't do it rather than offering a setting that silently breaks association.
+
+#### Factory wifi (first-boot / post-reset)
+
+The factory SSID is the gateway to the bootstrap captive portal (§6.8). Its security properties matter — anyone who can associate to it can hit the unauth `/api/bootstrap/*` endpoints.
+
+- **Encryption:** WPA3-SAE only. No transition mode at factory; a user who needs WPA2 transition can opt in *after* setup completes from the SPA. The pre-setup audience shouldn't have to navigate the tradeoff.
+- **Password:** per-device unique, generated at first boot from a CSPRNG, formatted as 5 dictionary-derived words for typing without errors (think Diceware, but printed on the device label rather than memorized). Minimum entropy ≥ 60 bits. *Never* derived from MAC, serial, or any other on-device material — those are externally observable.
+- **Label printing for the audience:** since v1.0 testing-phase images are flashed onto hardware the maintainer ships to early testers, the factory wifi password gets generated and printed onto a sticker the maintainer applies to the device. This is friction we accept for the test phase; the long-term distribution model is a separate conversation (see §10.4).
+- **SSID:** generic, non-identifying. Not `BubbleUI-AXT1800-A4F2` (leaks hardware + serial-ish info to anyone scanning); not the user's name. Default is `BubbleUI` with a small random suffix for collision avoidance, changeable in the wizard.
+
+#### What this is not yet covered by
+
+- **WPA3-Enterprise.** Not relevant to the audience (no RADIUS server in the threat model).
+- **Per-client randomized PSKs / OWE.** Out of scope for v1.0 — adds UI complexity for marginal benefit on a travel router. Revisit if a clear demand emerges.
+- **Roaming / 802.11r FT.** Travel routers aren't roaming endpoints in any meaningful sense.
 
 ### 6.4 Encrypted DNS (DoH/DoT)
 
@@ -626,6 +677,18 @@ Picking among these is work that follows showing the UI to the community, not wo
    - **Decision for M3:** single-probe with cert pin to `https://detectportal.firefox.com/success.txt` as a deliberate placeholder. Mozilla has the least-bad privacy posture of the OS-probe operators, the success.txt response is trivially verifiable, and the pin foils mid-flight tampering. Revisit before v1.0 — quorum is the likely landing spot.
 
 8. **HW-bound at-rest wrap via FIDO2 `hmac-secret`** *(post-v1.0)*. Earlier drafts of §5.5 used the router-attached YubiKey's HMAC-SHA1 oracle to derive a wrap key for the slot-2 secret stored on disk: physical theft of the router without the key yielded nothing usable. That construction is gone with the router-attached path (§5.1). The intended replacement is the FIDO2 `hmac-secret` extension on a registered WebAuthn credential — the user's authenticator (Touch ID, YubiKey 5+, etc.) derives a per-credential symmetric key from a server-stored salt, the daemon uses that to wrap whatever symmetric secret needs at-rest protection (cached WG keys, future session-rebind tokens), and the wrapped blob can only be unwrapped while the user re-authenticates with that authenticator. Work items: (a) verify `github.com/go-webauthn/webauthn` supports the `hmac-secret` extension parameter on both register and assert (it does as of v0.10.x, but we haven't wired it); (b) add a per-credential salt column to the credentials store; (c) gate the wrap flow on a fresh assertion so the wrap key never persists in RAM beyond a single login window; (d) decide what actually gets wrapped — there is nothing in v1.0 that strictly needs HW-bound at-rest protection (WG private keys are the most defensible candidate), so this remains an enabling design, not a forcing one.
+
+9. **TOTP as an optional second factor on top of WebAuthn** *(under exploration; possibly v1.1)*. Today, the auth flow is single-factor: a successful WebAuthn assertion mints a session. The user has asked whether we can offer an opt-in "WebAuthn **and** TOTP" mode where both factors are required at every login. Sketched design:
+
+   - **Provisioning.** Settings → Security → "Add TOTP as a second factor." Daemon generates a 160-bit random secret, surfaces it as both a QR (otpauth://) and a typed string. User enrolls in an authenticator app (Aegis, Bitwarden, Authy, etc.) on a device of their choice and confirms by typing a current code. Server validates the code, stores the secret, marks 2FA enabled. Per-user single TOTP enrollment — no multi-TOTP, no per-authenticator TOTP.
+   - **Login.** After `FinishLoginWebAuthn` validates the assertion, if 2FA is enabled the daemon does NOT mint a session yet — it returns a "2fa_required" challenge with a short-lived (60s) handle. SPA prompts for the 6-digit code. `POST /auth/2fa/totp/verify` accepts `{handle, code}`, validates against the stored secret with the standard ±1 window (30s clock skew tolerance), and on success mints the session.
+   - **Anti-replay.** Store the last accepted code's counter (`floor(time/period)`). Reject reuse within the validity window. Standard TOTP hygiene.
+   - **Recovery.** Lose the WebAuthn authenticator and the TOTP authenticator both → recovery code path (§5.4) wipes the credential set AND the TOTP secret, returning to setup mode. Lose just the TOTP authenticator → "Re-enroll TOTP" flow gated on a fresh WebAuthn assertion plus a recovery-code burn (one-time use; a new recovery code is minted). Lose just the WebAuthn authenticator → existing register-new-credential flow already supports this; TOTP enrollment carries forward unchanged.
+   - **Time correctness.** §6.6 already nails this — browser-supplied time at first boot, daemon refuses to fire TOTP at all until the clock is plausible (within `now - persisted_last_seen` of `now`, plus a sanity floor of "year ≥ 2024"). Stale-clock failures must surface to the user as "the router's clock is wrong, re-sync from your browser" — not as "TOTP rejected".
+   - **Storage and the §11.8 dependency.** The TOTP shared secret is *symmetric* — anyone who can read `/etc/bubble/credentials.db` plus knows the time can produce valid codes. This is the same at-rest-secret problem §11.8 is meant to solve for the WebAuthn-side. Until §11.8 lands, on-disk theft of the router yields a TOTP secret that the attacker can use until the user rotates it. This is the chief reason TOTP is positioned as v1.1, not v1.0: it pairs naturally with §11.8 and shipping it without HW-bound wrap is a strict downgrade vs. WebAuthn-alone for the router-physically-stolen threat. If we ship before §11.8, the UI must clearly state "second factor adds defense against *remote* compromise of your authenticator; it does **not** add defense if the router itself is physically taken."
+   - **Threat-model honest answer.** TOTP-as-2FA primarily defends against an attacker who has compromised the user's WebAuthn authenticator but does NOT have access to a *second* device storing the TOTP secret. The audience benefit is real if (and only if) the user stores TOTP on a device different from where their WebAuthn factor lives — phone's authenticator app while WebAuthn is the laptop's platform authenticator, or vice versa. If both factors live on the same phone (Authy + iCloud-Keychain platform passkey), 2FA collapses to 1FA at the device level. Wizard / Settings should explicitly nudge "use a different device for TOTP than for WebAuthn" — not enforce, since enforcement is brittle and the user might have only one device.
+   - **Implementation cost.** `github.com/pquerna/otp` is the standard pure-Go TOTP library (`otp/totp`), small, well-maintained, no transitive deps. Net code add ≈150 LOC + tests + a small UI step. The expensive part is the UX of doing 2FA *well* for an audience that hasn't done it before (clear copy, the right friction at enrollment, sane error messages, the time-skew fallback path).
+   - **Open question we'll resolve before greenlighting:** is the user's threat model genuinely better-served by TOTP-as-2FA than by **multi-WebAuthn-credential** (register both your laptop's platform authenticator *and* your phone's, requiring either to log in — adds "device variety" against single-device compromise without the symmetric-secret-on-router problem)? Multi-credential is already implemented today. If the user-as-product-author values "two distinct ceremonies at every login" more than "two distinct devices either of which works," TOTP wins; otherwise multi-credential is the cheaper, stronger answer. We discuss before committing.
 
 ## 12. Milestones
 
