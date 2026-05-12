@@ -262,28 +262,66 @@ jobs:
           # include/rootfs.mk wraps opkg-only fixups inside:
           #
           #   if [ -z "$(CONFIG_USE_APK)" ]; then \
-          #       $(if $(IB),,awk -i inplace ...) ; \
-          #       $(if $(SOURCE_DATE_EPOCH),sed -i ... ;) \
+          #       $(if $(IB),,awk -i inplace ... opkg/status) ; \
+          #       $(if $(SOURCE_DATE_EPOCH),sed -i ... opkg/status ;) \
           #   fi;
           #
-          # Under apk builds (CONFIG_USE_APK=y) the `then` branch is
-          # never executed at runtime, but bash still has to *parse* it.
-          # In Image Builder context (IB=y) the awk substitution
-          # collapses to empty, leaving `then  ; sed ... ; fi` — bash
-          # refuses an empty body before the `;` and the whole rootfs
-          # prepare step dies with a syntax error. Same recipe on
-          # `openwrt-25.12` and `main` of openwrt/openwrt as of
-          # 2026-05-12; no upstream fix.
+          # The trailing `;` after the awk's closing paren lives
+          # *outside* the $(if $(IB),,...) substitution. Under Image
+          # Builder (IB=y) the awk vanishes but the standalone `;`
+          # remains, so the rendered recipe becomes
           #
-          # Workaround: insert a `: ;` no-op so the `then` block parses
-          # regardless of which Make substitutions are empty. Patch is
-          # local to this CI run's Image Builder copy. The grep below
-          # fails the build if upstream ever changes the recipe shape,
-          # so we notice instead of silently doing nothing.
+          #   if [ -z "y" ]; then  ; sed -i "..." ; fi;
+          #
+          # — bash refuses the empty command between `then` and `;` and
+          # the rootfs prepare step dies with a syntax error. The same
+          # broken shape is on `openwrt-25.12` and `main` of
+          # openwrt/openwrt as of 2026-05-12; no upstream fix.
+          #
+          # Fix: move that trailing `;` *inside* the $(if $(IB),,...)
+          # so it vanishes together with the awk command when IB=y.
+          # Specifically, swap `opkg/status) ;` to `opkg/status ;)`.
+          # Verified bash-parses under all four apk × IB × SDE
+          # substitution combinations.
+          #
+          # The grep-before-and-after the sed below fails the build
+          # if upstream ever changes the recipe shape (either by
+          # removing the broken pattern or by failing to leave the
+          # patched pattern), so we notice instead of silently doing
+          # nothing.
           target="$IB/include/rootfs.mk"
           test -f "$target"
-          sed -i 's#if \[ -z "$(CONFIG_USE_APK)" \]; then \\#if [ -z "$(CONFIG_USE_APK)" ]; then : ; \\#' "$target"
-          grep -F 'if [ -z "$(CONFIG_USE_APK)" ]; then : ;' "$target" >/dev/null
+          grep -F 'opkg/status) ;' "$target" >/dev/null
+          sed -i 's#opkg/status) ;#opkg/status ;)#' "$target"
+          grep -F 'opkg/status ;)' "$target" >/dev/null
+
+      - name: Verify patched recipe shape
+        env:
+          IB: ${{ steps.ib.outputs.ib_dir }}
+        run: |
+          set -e
+          # Cheap, robust regression check: assert the post-patch
+          # rootfs.mk contains the exact one-line shape we expect for
+          # the awk substitution. Anything else (different ordering,
+          # a new make conditional inside the body, the recipe being
+          # rewritten upstream) makes this fail and surfaces the diff
+          # immediately — better than discovering it mid-image-build.
+          #
+          # We avoid a generic `bash -n` of the rendered recipe here:
+          # rootfs.mk uses $(if ...) substitutions with nested $(VAR)
+          # references that aren't trivially expandable in shell, and
+          # a brittle expansion engine would false-alarm more often
+          # than it would catch real bugs. If upstream changes the
+          # recipe in a way that survives this grep but still breaks
+          # bash parsing, `make image` below will catch it.
+          target="$IB/include/rootfs.mk"
+          grep -F "}1' \$(1)/usr/lib/opkg/status ;)" "$target" >/dev/null
+          # Belt-and-braces: the un-patched-shape pattern must no
+          # longer be present anywhere in the file.
+          if grep -F "opkg/status) ;" "$target" >/dev/null; then
+            echo "::error::stale 'opkg/status) ;' pattern still present after patch"
+            exit 1
+          fi
 
       - name: Build firmware image
         env:
