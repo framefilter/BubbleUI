@@ -246,12 +246,44 @@ jobs:
           # picked up as a local repo; `make image` indexes them before
           # resolving PACKAGES. Transitive deps of bubbleui (nginx-ssl,
           # nftables, wireguard-tools, dnsmasq-full, https-dns-proxy,
-          # yubikey-personalization, ca-bundle, px5g-mbedtls — see
-          # package/bubbleui/Makefile) come from the upstream 25.12.3
-          # feed, also indexed automatically by Image Builder.
+          # ca-bundle, px5g-mbedtls — see package/bubbleui/Makefile)
+          # come from the upstream 25.12.3 feed, also indexed
+          # automatically by Image Builder.
           mkdir -p "$IB/packages"
           cp bubbleui-pkg/bubbleui-*.apk "$IB/packages/"
           ls -la "$IB/packages/"
+
+      - name: Patch Image Builder rootfs.mk (upstream OpenWRT 25.12 bug)
+        env:
+          IB: ${{ steps.ib.outputs.ib_dir }}
+        run: |
+          set -e
+          # OpenWRT 25.12.x Image Builder's prepare_rootfs recipe in
+          # include/rootfs.mk wraps opkg-only fixups inside:
+          #
+          #   if [ -z "$(CONFIG_USE_APK)" ]; then \
+          #       $(if $(IB),,awk -i inplace ...) ; \
+          #       $(if $(SOURCE_DATE_EPOCH),sed -i ... ;) \
+          #   fi;
+          #
+          # Under apk builds (CONFIG_USE_APK=y) the `then` branch is
+          # never executed at runtime, but bash still has to *parse* it.
+          # In Image Builder context (IB=y) the awk substitution
+          # collapses to empty, leaving `then  ; sed ... ; fi` — bash
+          # refuses an empty body before the `;` and the whole rootfs
+          # prepare step dies with a syntax error. Same recipe on
+          # `openwrt-25.12` and `main` of openwrt/openwrt as of
+          # 2026-05-12; no upstream fix.
+          #
+          # Workaround: insert a `: ;` no-op so the `then` block parses
+          # regardless of which Make substitutions are empty. Patch is
+          # local to this CI run's Image Builder copy. The grep below
+          # fails the build if upstream ever changes the recipe shape,
+          # so we notice instead of silently doing nothing.
+          target="$IB/include/rootfs.mk"
+          test -f "$target"
+          sed -i 's#if \[ -z "$(CONFIG_USE_APK)" \]; then \\#if [ -z "$(CONFIG_USE_APK)" ]; then : ; \\#' "$target"
+          grep -F 'if [ -z "$(CONFIG_USE_APK)" ]; then : ;' "$target" >/dev/null
 
       - name: Build firmware image
         env:
