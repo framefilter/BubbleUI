@@ -260,4 +260,3 @@ func (a *Authenticator) FinishLoginWebAuthn(ctx context.Context, handle string, 
 	}
 	return row.ID, nil
 }
-
