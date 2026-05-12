@@ -3,8 +3,6 @@
 //
 // Routing surface (all paths return JSON):
 //
-//	POST /auth/yubikey/provision            — first-boot wizard: program slot 2
-//	POST /auth/yubikey/login                — run §5.3 YubiKey login
 //	POST /auth/webauthn/register/begin      — start a WebAuthn registration
 //	POST /auth/webauthn/register/finish     — finish registration, persist
 //	POST /auth/webauthn/login/begin         — start a WebAuthn login
@@ -13,7 +11,7 @@
 //	GET  /auth/session/whoami               — current session, if any
 //	POST /auth/session/logout               — revoke the current session
 //	GET  /auth/setup-status                 — has-any-credential gate for the wizard
-//	GET  /auth/health                       — credential + YubiKey-present (composer feed)
+//	GET  /auth/health                       — credential-present (composer feed)
 //	POST /api/time/sync                     — browser-supplied time per §6.6
 //
 // Cookies: bubble-session, HttpOnly, SameSite=Strict, Secure (when TLS),
@@ -26,7 +24,6 @@
 package httpapi
 
 import (
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -40,7 +37,8 @@ import (
 
 // Config controls Server construction.
 type Config struct {
-	// Auth is the authenticator wired with a store + yubikey oracle.
+	// Auth is the authenticator wired with the credentials store and,
+	// optionally, a WebAuthn engine.
 	Auth *auth.Authenticator
 
 	// Sessions is the session manager backed by the same SQLite DB.
@@ -104,8 +102,6 @@ func (s *Server) handler() http.Handler {
 }
 
 func (s *Server) routes() {
-	s.mux.HandleFunc("POST /auth/yubikey/provision", s.handleYubiKeyProvision)
-	s.mux.HandleFunc("POST /auth/yubikey/login", s.handleYubiKeyLogin)
 	s.mux.HandleFunc("POST /auth/webauthn/register/begin", s.handleWebAuthnRegisterBegin)
 	s.mux.HandleFunc("POST /auth/webauthn/register/finish", s.handleWebAuthnRegisterFinish)
 	s.mux.HandleFunc("POST /auth/webauthn/login/begin", s.handleWebAuthnLoginBegin)
@@ -119,64 +115,6 @@ func (s *Server) routes() {
 }
 
 // --- handlers ---
-
-// handleYubiKeyProvision is the wizard's "program this YubiKey on the
-// router USB" endpoint. Bootstrap-only: rejects with 409 if any
-// credential is already registered, so it can never be used to overwrite
-// an existing setup. Returns the recovery code, the slot-2 secret hex
-// (in case ykman programming fails and the user has to copy-paste a
-// command), and a flag indicating whether ykman ran successfully.
-func (s *Server) handleYubiKeyProvision(w http.ResponseWriter, r *http.Request) {
-	has, err := s.cfg.Auth.HasAnyCredential(r.Context())
-	if err != nil {
-		s.logger.Error("HasAnyCredential", "err", err)
-		writeError(w, http.StatusInternalServerError, "internal")
-		return
-	}
-	if has {
-		writeError(w, http.StatusConflict, "device is already provisioned; use /auth/recover to reset")
-		return
-	}
-	res, err := s.cfg.Auth.ProvisionYubiKeyAndProgram(r.Context(), "")
-	if err != nil {
-		s.logger.Error("provision yubikey", "err", err)
-		writeError(w, http.StatusInternalServerError, "provision failed")
-		return
-	}
-	body := map[string]any{
-		"credential_id":  res.CredentialID,
-		"recovery_code":  res.RecoveryCode,
-		"not_programmed": res.NotProgrammed,
-	}
-	if res.NotProgrammed {
-		// Surface the secret hex only when the daemon couldn't program
-		// the key automatically — the user needs it to run ykman manually.
-		body["secret_hex"] = hexEncode(res.Secret)
-		body["program_hint"] = res.ProgramHint
-	}
-	writeJSON(w, http.StatusOK, body)
-}
-
-func (s *Server) handleYubiKeyLogin(w http.ResponseWriter, r *http.Request) {
-	credID, err := s.cfg.Auth.LoginYubiKey(r.Context())
-	if err != nil {
-		// Don't differentiate ErrNoCredential / ErrChallengeFail to clients —
-		// every failure is "rejected."
-		writeError(w, http.StatusUnauthorized, "rejected")
-		return
-	}
-	token, sess, err := s.cfg.Sessions.Create(r.Context(), credID)
-	if err != nil {
-		s.logger.Error("session create failed", "err", err)
-		writeError(w, http.StatusInternalServerError, "internal")
-		return
-	}
-	s.setSessionCookie(w, token, sess.ExpiresAt)
-	writeJSON(w, http.StatusOK, map[string]any{
-		"credential_id": credID,
-		"expires_at":    sess.ExpiresAt.Unix(),
-	})
-}
 
 // --- WebAuthn handlers ---
 
@@ -348,13 +286,11 @@ func (s *Server) handleSetupStatus(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleHealth reports the live state of the auth daemon's
-// dependencies. Today that's just "is a YubiKey currently visible to
-// the router-side oracle?" which the bubble-hwd composer uses to
-// drive the §13.5 NoKey LED state. Reachable without auth: the
-// answer is non-secret (an attacker on the LAN can probe the USB
-// state by trying to log in anyway) and bubble-hwd has no session
-// to present.
+// handleHealth reports the live state of the auth daemon — currently
+// just whether any credential is registered. Reachable without auth:
+// the answer is non-secret (an attacker on the LAN can probe by trying
+// to log in anyway) and the field is useful to bubble-hwd's composer
+// and the SPA without holding a session.
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	hasCred, err := s.cfg.Auth.HasAnyCredential(r.Context())
 	if err != nil {
@@ -362,13 +298,8 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "internal")
 		return
 	}
-	// "yubikey_present" is meaningful only when a YubiKey credential
-	// is registered AND the oracle is the live ykchalresp adapter
-	// (Mock always reports present for whatever it has plugged in).
-	yubiPresent := s.cfg.Auth.Yubi != nil && s.cfg.Auth.Yubi.Present(r.Context())
 	writeJSON(w, http.StatusOK, map[string]any{
 		"has_credentials": hasCred,
-		"yubikey_present": yubiPresent,
 	})
 }
 
@@ -563,8 +494,6 @@ func writeJSON(w http.ResponseWriter, code int, body any) {
 func writeError(w http.ResponseWriter, code int, msg string) {
 	writeJSON(w, code, map[string]any{"error": msg})
 }
-
-func hexEncode(b []byte) string { return hex.EncodeToString(b) }
 
 // Ensure compile-time that *Server satisfies http.Handler.
 var _ http.Handler = (*Server)(nil)

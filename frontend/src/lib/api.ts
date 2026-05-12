@@ -81,22 +81,6 @@ export const logout = () => request<{ status: string }>('POST', '/auth/session/l
 export const setupStatus = () =>
   request<{ has_credentials: boolean }>('GET', '/auth/setup-status');
 
-// --- yubikey ---
-
-export const yubikeyLogin = () => request<LoginOk>('POST', '/auth/yubikey/login');
-
-export interface YubiKeyProvisionOk {
-  credential_id: number;
-  recovery_code: string;
-  not_programmed: boolean;
-  // Only present when not_programmed is true:
-  secret_hex?: string;
-  program_hint?: string;
-}
-
-export const yubikeyProvision = () =>
-  request<YubiKeyProvisionOk>('POST', '/auth/yubikey/provision', {});
-
 // --- recovery ---
 
 export const recover = (code: string) =>

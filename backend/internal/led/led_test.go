@@ -6,7 +6,7 @@ import (
 )
 
 func TestStateRoundtrip(t *testing.T) {
-	for _, s := range []State{StateOff, StateBooting, StateSetup, StateSecured, StateKillswitch, StateSigninOpen, StateNoKey, StateFault} {
+	for _, s := range []State{StateOff, StateBooting, StateSetup, StateSecured, StateKillswitch, StateSigninOpen, StateFault} {
 		got, err := ParseState(s.String())
 		if err != nil {
 			t.Errorf("ParseState(%q): %v", s, err)

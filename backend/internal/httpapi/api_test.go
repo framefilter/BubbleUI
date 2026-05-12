@@ -16,20 +16,20 @@ import (
 	gowa "github.com/go-webauthn/webauthn/webauthn"
 
 	"github.com/framefilter/bubbleui/backend/internal/auth"
+	bcrypto "github.com/framefilter/bubbleui/backend/internal/crypto"
 	"github.com/framefilter/bubbleui/backend/internal/session"
 	"github.com/framefilter/bubbleui/backend/internal/store"
 	"github.com/framefilter/bubbleui/backend/internal/webauthn"
-	"github.com/framefilter/bubbleui/backend/internal/yubikey"
 )
 
 type testRig struct {
-	server  *httptest.Server
-	store   *store.Store
-	auth    *auth.Authenticator
-	mock    *yubikey.Mock
-	setTime func(t time.Time) error
-	timeMu  sync.Mutex
-	lastSet time.Time
+	server   *httptest.Server
+	store    *store.Store
+	auth     *auth.Authenticator
+	sessions *session.Manager
+	setTime  func(t time.Time) error
+	timeMu   sync.Mutex
+	lastSet  time.Time
 }
 
 func newRig(t *testing.T) *testRig {
@@ -40,9 +40,7 @@ func newRig(t *testing.T) *testRig {
 	}
 	t.Cleanup(func() { _ = s.Close() })
 
-	mock := yubikey.NewMock()
-	a := auth.New(s, mock)
-	a.Programmer = mock // wizard provision flow uses the same mock instance
+	a := auth.New(s)
 
 	// Every rig gets a WebAuthn engine — the new endpoints assume one is
 	// configured, and crypto-free tests still need it to route correctly.
@@ -61,7 +59,7 @@ func newRig(t *testing.T) *testRig {
 		t.Fatalf("session.NewManager: %v", err)
 	}
 
-	rig := &testRig{store: s, auth: a, mock: mock}
+	rig := &testRig{store: s, auth: a, sessions: mgr}
 	rig.setTime = func(tm time.Time) error {
 		rig.timeMu.Lock()
 		rig.lastSet = tm
@@ -86,16 +84,58 @@ func (rig *testRig) client(t *testing.T) *http.Client {
 	return &http.Client{Jar: jar, Timeout: 10 * time.Second}
 }
 
-func (rig *testRig) provisionAndProgram(t *testing.T) (recoveryCode string) {
+// seedWebAuthnCredential plants a fake WebAuthn credential row in the
+// store. The cryptographic fields are nonsense — good enough for
+// endpoints that only check existence or echo allowed-credential IDs.
+func (rig *testRig) seedWebAuthnCredential(t *testing.T) int64 {
 	t.Helper()
-	res, err := rig.auth.ProvisionYubiKey(context.Background(), "")
+	id, err := rig.store.AddCredential(context.Background(), store.Credential{
+		Kind:           store.KindWebAuthn,
+		Label:          "fake",
+		CredentialID:   []byte("demo-cred"),
+		PublicMaterial: fakeWebAuthnCredentialBlob(t, []byte("demo-cred")),
+	})
 	if err != nil {
-		t.Fatalf("ProvisionYubiKey: %v", err)
+		t.Fatalf("seed credential: %v", err)
 	}
-	if err := rig.mock.Program(context.Background(), yubikey.Slot2, res.Secret); err != nil {
-		t.Fatalf("Program: %v", err)
+	return id
+}
+
+// seedRecoveryCode plants a recovery code in the store and returns the
+// plaintext to the caller. Mirrors what FinishRegisterWebAuthn does on
+// the first credential registration.
+func (rig *testRig) seedRecoveryCode(t *testing.T) string {
+	t.Helper()
+	code, err := bcrypto.NewRecoveryCode()
+	if err != nil {
+		t.Fatalf("NewRecoveryCode: %v", err)
 	}
-	return res.RecoveryCode
+	hashed, err := bcrypto.HashRecoveryCode(code)
+	if err != nil {
+		t.Fatalf("HashRecoveryCode: %v", err)
+	}
+	if err := rig.store.SetRecoveryCodeHash(context.Background(), hashed); err != nil {
+		t.Fatalf("SetRecoveryCodeHash: %v", err)
+	}
+	return code
+}
+
+// loginAs mints a session for credID and installs the cookie on c so
+// subsequent requests look authenticated. Used as a shortcut around the
+// real WebAuthn ceremony, which we can't run in unit tests.
+func (rig *testRig) loginAs(t *testing.T, c *http.Client, credID int64) {
+	t.Helper()
+	token, sess, err := rig.sessions.Create(context.Background(), credID)
+	if err != nil {
+		t.Fatalf("session.Create: %v", err)
+	}
+	u, _ := http.NewRequest("GET", rig.server.URL, nil)
+	c.Jar.SetCookies(u.URL, []*http.Cookie{{
+		Name:    session.CookieName,
+		Value:   token,
+		Path:    "/",
+		Expires: sess.ExpiresAt,
+	}})
 }
 
 func decodeJSON(t *testing.T, body io.Reader) map[string]any {
@@ -105,67 +145,6 @@ func decodeJSON(t *testing.T, body io.Reader) map[string]any {
 		t.Fatalf("decode json: %v", err)
 	}
 	return m
-}
-
-func TestYubiKeyLoginHappyPath(t *testing.T) {
-	rig := newRig(t)
-	rig.provisionAndProgram(t)
-	c := rig.client(t)
-
-	resp, err := c.Post(rig.server.URL+"/auth/yubikey/login", "", nil)
-	if err != nil {
-		t.Fatalf("POST login: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want 200", resp.StatusCode)
-	}
-
-	var hasCookie bool
-	for _, c := range resp.Cookies() {
-		if c.Name == session.CookieName && c.Value != "" {
-			hasCookie = true
-		}
-	}
-	if !hasCookie {
-		t.Fatal("expected session cookie set")
-	}
-
-	body := decodeJSON(t, resp.Body)
-	if _, ok := body["credential_id"]; !ok {
-		t.Fatalf("response missing credential_id: %v", body)
-	}
-}
-
-func TestYubiKeyLoginRejectsWithoutKey(t *testing.T) {
-	rig := newRig(t)
-	// No provision → no credential.
-	c := rig.client(t)
-	resp, err := c.Post(rig.server.URL+"/auth/yubikey/login", "", nil)
-	if err != nil {
-		t.Fatalf("POST: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("status = %d, want 401", resp.StatusCode)
-	}
-}
-
-func TestYubiKeyLoginRejectsWrongKey(t *testing.T) {
-	rig := newRig(t)
-	rig.provisionAndProgram(t)
-	// Reprogram with a wrong secret.
-	_ = rig.mock.Program(context.Background(), yubikey.Slot2, []byte("0123456789abcdefghij"))
-
-	c := rig.client(t)
-	resp, err := c.Post(rig.server.URL+"/auth/yubikey/login", "", nil)
-	if err != nil {
-		t.Fatalf("POST: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("status = %d, want 401", resp.StatusCode)
-	}
 }
 
 func TestWhoamiUnauthenticated(t *testing.T) {
@@ -184,14 +163,9 @@ func TestWhoamiUnauthenticated(t *testing.T) {
 
 func TestWhoamiAuthenticated(t *testing.T) {
 	rig := newRig(t)
-	rig.provisionAndProgram(t)
+	credID := rig.seedWebAuthnCredential(t)
 	c := rig.client(t)
-
-	loginResp, err := c.Post(rig.server.URL+"/auth/yubikey/login", "", nil)
-	if err != nil {
-		t.Fatalf("login: %v", err)
-	}
-	loginResp.Body.Close()
+	rig.loginAs(t, c, credID)
 
 	resp, err := c.Get(rig.server.URL + "/auth/session/whoami")
 	if err != nil {
@@ -206,14 +180,9 @@ func TestWhoamiAuthenticated(t *testing.T) {
 
 func TestLogoutClearsSession(t *testing.T) {
 	rig := newRig(t)
-	rig.provisionAndProgram(t)
+	credID := rig.seedWebAuthnCredential(t)
 	c := rig.client(t)
-
-	loginResp, err := c.Post(rig.server.URL+"/auth/yubikey/login", "", nil)
-	if err != nil {
-		t.Fatalf("login: %v", err)
-	}
-	loginResp.Body.Close()
+	rig.loginAs(t, c, credID)
 
 	logoutResp, err := c.Post(rig.server.URL+"/auth/session/logout", "", nil)
 	if err != nil {
@@ -221,7 +190,6 @@ func TestLogoutClearsSession(t *testing.T) {
 	}
 	logoutResp.Body.Close()
 
-	// Whoami should now report unauthenticated.
 	resp, err := c.Get(rig.server.URL + "/auth/session/whoami")
 	if err != nil {
 		t.Fatalf("GET: %v", err)
@@ -235,11 +203,12 @@ func TestLogoutClearsSession(t *testing.T) {
 
 func TestRecoverEndpoint(t *testing.T) {
 	rig := newRig(t)
-	code := rig.provisionAndProgram(t)
+	credID := rig.seedWebAuthnCredential(t)
+	code := rig.seedRecoveryCode(t)
 	c := rig.client(t)
 
 	// Start a session, then recover — recover must invalidate it.
-	c.Post(rig.server.URL+"/auth/yubikey/login", "", nil)
+	rig.loginAs(t, c, credID)
 
 	resp, err := c.Post(rig.server.URL+"/auth/recover", "application/json",
 		strings.NewReader(`{"code":"`+code+`"}`))
@@ -251,7 +220,6 @@ func TestRecoverEndpoint(t *testing.T) {
 		t.Fatalf("recover status = %d, want 200", resp.StatusCode)
 	}
 
-	// Existing session should be wiped.
 	whoamiResp, err := c.Get(rig.server.URL + "/auth/session/whoami")
 	if err != nil {
 		t.Fatalf("GET: %v", err)
@@ -265,7 +233,7 @@ func TestRecoverEndpoint(t *testing.T) {
 
 func TestRecoverRejectsBadCode(t *testing.T) {
 	rig := newRig(t)
-	rig.provisionAndProgram(t)
+	_ = rig.seedRecoveryCode(t)
 	c := rig.client(t)
 
 	resp, err := c.Post(rig.server.URL+"/auth/recover", "application/json",
@@ -361,8 +329,7 @@ func TestTimeSyncForceWithoutHookReturns503(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
-	mock := yubikey.NewMock()
-	a := auth.New(s, mock)
+	a := auth.New(s)
 	mgr, _ := session.NewManager(context.Background(), s.DB())
 	srv := New(Config{Auth: a, Sessions: mgr, Insecure: true /* SetSystemTime: nil */})
 	ts := httptest.NewServer(srv)
@@ -422,8 +389,7 @@ func TestOriginCheckBlocksDisallowed(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
-	mock := yubikey.NewMock()
-	a := auth.New(s, mock)
+	a := auth.New(s)
 	mgr, _ := session.NewManager(context.Background(), s.DB())
 	srv := New(Config{
 		Auth:           a,
@@ -434,8 +400,13 @@ func TestOriginCheckBlocksDisallowed(t *testing.T) {
 	ts := httptest.NewServer(srv)
 	defer ts.Close()
 
-	req, _ := http.NewRequest("POST", ts.URL+"/auth/yubikey/login", nil)
+	// Use /auth/recover (still a state-changing POST) to drive the
+	// origin check. The endpoint's body validation will reject the
+	// payload on the allowed-origin path, but only after the origin
+	// gate has been cleared — that's the order we want to verify.
+	req, _ := http.NewRequest("POST", ts.URL+"/auth/recover", strings.NewReader(`{}`))
 	req.Header.Set("Origin", "https://evil.example")
+	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -445,10 +416,9 @@ func TestOriginCheckBlocksDisallowed(t *testing.T) {
 		t.Fatalf("disallowed origin: status = %d, want 403", resp.StatusCode)
 	}
 
-	// Allowed origin should pass the origin check (even if the underlying
-	// auth fails for lack of a credential).
-	req2, _ := http.NewRequest("POST", ts.URL+"/auth/yubikey/login", nil)
+	req2, _ := http.NewRequest("POST", ts.URL+"/auth/recover", strings.NewReader(`{}`))
 	req2.Header.Set("Origin", "https://bubble.local")
+	req2.Header.Set("Content-Type", "application/json")
 	resp2, err := http.DefaultClient.Do(req2)
 	if err != nil {
 		t.Fatalf("Do: %v", err)
@@ -459,88 +429,10 @@ func TestOriginCheckBlocksDisallowed(t *testing.T) {
 	}
 }
 
-func TestYubiKeyProvisionHappyPath(t *testing.T) {
-	rig := newRig(t)
-	c := rig.client(t)
-
-	resp, err := c.Post(rig.server.URL+"/auth/yubikey/provision", "application/json", strings.NewReader(`{}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want 200", resp.StatusCode)
-	}
-	body := decodeJSON(t, resp.Body)
-	if body["recovery_code"] == nil || body["recovery_code"] == "" {
-		t.Fatalf("missing recovery_code: %v", body)
-	}
-	if body["not_programmed"] != false {
-		t.Fatalf("expected not_programmed=false (mock programmer ran), got %v", body)
-	}
-
-	// After provision, login should now succeed because the mock got
-	// programmed with the secret, and the mock acts as both Oracle and Programmer.
-	loginResp, err := c.Post(rig.server.URL+"/auth/yubikey/login", "", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer loginResp.Body.Close()
-	if loginResp.StatusCode != http.StatusOK {
-		t.Fatalf("post-provision login status = %d, want 200", loginResp.StatusCode)
-	}
-}
-
-func TestYubiKeyProvisionRejectedAfterCredentialExists(t *testing.T) {
-	rig := newRig(t)
-	rig.provisionAndProgram(t) // writes a credential
-
-	c := rig.client(t)
-	resp, err := c.Post(rig.server.URL+"/auth/yubikey/provision", "application/json", strings.NewReader(`{}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusConflict {
-		t.Fatalf("status = %d, want 409", resp.StatusCode)
-	}
-}
-
-func TestYubiKeyProvisionWithoutProgrammerReportsManual(t *testing.T) {
-	// Build a rig but null out the Programmer to simulate a daemon
-	// running on a host without ykman.
-	s, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "creds.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = s.Close() })
-	mock := yubikey.NewMock()
-	a := auth.New(s, mock)
-	// Programmer is intentionally nil here.
-	mgr, _ := session.NewManager(context.Background(), s.DB())
-	srv := New(Config{Auth: a, Sessions: mgr, Insecure: true})
-	ts := httptest.NewServer(srv)
-	defer ts.Close()
-
-	resp, err := http.Post(ts.URL+"/auth/yubikey/provision", "application/json", strings.NewReader(`{}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	body := decodeJSON(t, resp.Body)
-	if body["not_programmed"] != true {
-		t.Fatalf("expected not_programmed=true, got %v", body)
-	}
-	if body["secret_hex"] == nil || body["secret_hex"] == "" {
-		t.Fatalf("expected secret_hex when not programmed, got %v", body)
-	}
-}
-
 func TestSetupStatusReflectsCredentialCount(t *testing.T) {
 	rig := newRig(t)
 	c := rig.client(t)
 
-	// Fresh device → has_credentials = false.
 	resp, err := c.Get(rig.server.URL + "/auth/setup-status")
 	if err != nil {
 		t.Fatal(err)
@@ -551,10 +443,8 @@ func TestSetupStatusReflectsCredentialCount(t *testing.T) {
 		t.Fatalf("fresh device: expected has_credentials=false, got %v", body)
 	}
 
-	// Provision a YubiKey credential.
-	rig.provisionAndProgram(t)
+	rig.seedWebAuthnCredential(t)
 
-	// Now → has_credentials = true.
 	resp2, err := c.Get(rig.server.URL + "/auth/setup-status")
 	if err != nil {
 		t.Fatal(err)
@@ -562,15 +452,14 @@ func TestSetupStatusReflectsCredentialCount(t *testing.T) {
 	body = decodeJSON(t, resp2.Body)
 	resp2.Body.Close()
 	if body["has_credentials"] != true {
-		t.Fatalf("post-provision: expected has_credentials=true, got %v", body)
+		t.Fatalf("post-seed: expected has_credentials=true, got %v", body)
 	}
 }
 
-func TestHealthReportsYubiKeyAndCredentials(t *testing.T) {
+func TestHealthReportsCredentialState(t *testing.T) {
 	rig := newRig(t)
 	c := rig.client(t)
 
-	// Fresh: no credentials, no key plugged in (Mock starts unplugged).
 	resp, err := c.Get(rig.server.URL + "/auth/health")
 	if err != nil {
 		t.Fatal(err)
@@ -580,13 +469,8 @@ func TestHealthReportsYubiKeyAndCredentials(t *testing.T) {
 	if body["has_credentials"] != false {
 		t.Errorf("fresh: has_credentials = %v", body["has_credentials"])
 	}
-	if body["yubikey_present"] != false {
-		t.Errorf("fresh: yubikey_present = %v", body["yubikey_present"])
-	}
 
-	// Provision + program: Mock auto-plugs on Program(), so the key
-	// is reported present.
-	rig.provisionAndProgram(t)
+	rig.seedWebAuthnCredential(t)
 	resp2, err := c.Get(rig.server.URL + "/auth/health")
 	if err != nil {
 		t.Fatal(err)
@@ -594,25 +478,7 @@ func TestHealthReportsYubiKeyAndCredentials(t *testing.T) {
 	body = decodeJSON(t, resp2.Body)
 	resp2.Body.Close()
 	if body["has_credentials"] != true {
-		t.Errorf("post-provision: has_credentials = %v", body["has_credentials"])
-	}
-	if body["yubikey_present"] != true {
-		t.Errorf("post-provision: yubikey_present = %v", body["yubikey_present"])
-	}
-
-	// Unplug → yubikey_present flips back to false but credential row stays.
-	rig.mock.Unplug()
-	resp3, err := c.Get(rig.server.URL + "/auth/health")
-	if err != nil {
-		t.Fatal(err)
-	}
-	body = decodeJSON(t, resp3.Body)
-	resp3.Body.Close()
-	if body["has_credentials"] != true {
-		t.Errorf("unplugged: has_credentials = %v", body["has_credentials"])
-	}
-	if body["yubikey_present"] != false {
-		t.Errorf("unplugged: yubikey_present = %v", body["yubikey_present"])
+		t.Errorf("post-seed: has_credentials = %v", body["has_credentials"])
 	}
 }
 
@@ -657,11 +523,9 @@ func TestWebAuthnRegisterBeginBootstrapAllowed(t *testing.T) {
 
 func TestWebAuthnRegisterBeginRequiresAuthOnceCredentialExists(t *testing.T) {
 	rig := newRig(t)
-	// Provision a YubiKey so HasAnyCredential reports true.
-	rig.provisionAndProgram(t)
+	credID := rig.seedWebAuthnCredential(t)
 
 	c := rig.client(t)
-	// No session → 401.
 	resp, err := c.Post(rig.server.URL+"/auth/webauthn/register/begin", "application/json",
 		strings.NewReader(`{}`))
 	if err != nil {
@@ -672,13 +536,7 @@ func TestWebAuthnRegisterBeginRequiresAuthOnceCredentialExists(t *testing.T) {
 		t.Fatalf("status = %d, want 401", resp.StatusCode)
 	}
 
-	// Log in (authenticated session) → register/begin should succeed.
-	loginResp, err := c.Post(rig.server.URL+"/auth/yubikey/login", "", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	loginResp.Body.Close()
-
+	rig.loginAs(t, c, credID)
 	resp2, err := c.Post(rig.server.URL+"/auth/webauthn/register/begin", "application/json",
 		strings.NewReader(`{}`))
 	if err != nil {
@@ -694,7 +552,6 @@ func TestWebAuthnRegisterFinishRejectsBogusBody(t *testing.T) {
 	rig := newRig(t)
 	c := rig.client(t)
 
-	// Begin to get a valid handle.
 	beginResp, err := c.Post(rig.server.URL+"/auth/webauthn/register/begin", "application/json",
 		strings.NewReader(`{}`))
 	if err != nil {
@@ -753,16 +610,7 @@ func TestWebAuthnLoginBeginRejectsWithoutCredentials(t *testing.T) {
 
 func TestWebAuthnLoginBeginAllowsWithRegisteredCredential(t *testing.T) {
 	rig := newRig(t)
-	// Inject a fake WebAuthn credential row directly.
-	_, err := rig.store.AddCredential(context.Background(), store.Credential{
-		Kind:           store.KindWebAuthn,
-		Label:          "fake",
-		CredentialID:   []byte("demo-cred"),
-		PublicMaterial: fakeWebAuthnCredentialBlob(t, []byte("demo-cred")),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	rig.seedWebAuthnCredential(t)
 
 	c := rig.client(t)
 	resp, err := c.Post(rig.server.URL+"/auth/webauthn/login/begin", "application/json",
@@ -778,12 +626,7 @@ func TestWebAuthnLoginBeginAllowsWithRegisteredCredential(t *testing.T) {
 
 func TestWebAuthnLoginFinishRejectsBogusBody(t *testing.T) {
 	rig := newRig(t)
-	_, _ = rig.store.AddCredential(context.Background(), store.Credential{
-		Kind:           store.KindWebAuthn,
-		Label:          "fake",
-		CredentialID:   []byte("demo-cred"),
-		PublicMaterial: fakeWebAuthnCredentialBlob(t, []byte("demo-cred")),
-	})
+	rig.seedWebAuthnCredential(t)
 
 	c := rig.client(t)
 	beginResp, _ := c.Post(rig.server.URL+"/auth/webauthn/login/begin", "application/json",

@@ -2,8 +2,8 @@
 
 Go services that back the BubbleUI web UI.
 
-- `bubble-authd` — auth flows from DESIGN.md §5 (provision, log in,
-  recover, WebAuthn registration), exposed over HTTP for the SPA.
+- `bubble-authd` — auth flows from DESIGN.md §5 (WebAuthn registration
+  and login, recovery code), exposed over HTTP for the SPA.
 - `bubble-vpnd` — DESIGN.md §6.2 / §11.5 VPN strategy: a pool of
   saved WireGuard configs, parallel TCP-connect probing, "connect to
   fastest" as the default action. wg-quick integration lives behind
@@ -26,20 +26,15 @@ four daemons run as independent HTTP servers (8765 / 8766 / 8767 / 8768).
 cd backend
 go test ./...
 
-# End-to-end CLI demo, no hardware required:
-go run ./cmd/bubble-authd -db /tmp/creds.db -mock provision
-go run ./cmd/bubble-authd -db /tmp/creds.db -mock login
-go run ./cmd/bubble-authd -db /tmp/creds.db -mock status
-
-# HTTP server (on top of the same DB):
-go run ./cmd/bubble-authd -db /tmp/creds.db -mock serve -insecure
+# Run the daemon — WebAuthn registration/login happens from a browser:
+go run ./cmd/bubble-authd -db /tmp/creds.db serve -insecure -rp-id bubble.local
 # now: curl http://127.0.0.1:8765/auth/session/whoami
-#      curl -X POST http://127.0.0.1:8765/auth/yubikey/login
 ```
 
-`-mock` swaps in an in-memory YubiKey emulator and persists the
-generated slot-2 secret to a sidecar file next to the DB so the
-`serve` subcommand can re-create the virtual key state on startup.
+WebAuthn requires `-rp-id` matching the hostname the SPA is loaded from
+(no scheme/port). The four `/auth/webauthn/*` endpoints are disabled
+without it; the rest of the server still works for `recover`, `whoami`,
+`logout`, time-sync, and the setup-status probe.
 
 ## HTTP surface
 
@@ -49,7 +44,6 @@ All endpoints return JSON. Cookies are `bubble-session`,
 
 | Method | Path | Body | Notes |
 |---|---|---|---|
-| POST | `/auth/yubikey/login`              | none                                 | Runs §5.3 YubiKey login. Mints a session cookie. |
 | POST | `/auth/webauthn/register/begin`    | `{}`                                 | Starts a registration ceremony. Returns `{handle, options}`; forward `options.publicKey` to `navigator.credentials.create()`. |
 | POST | `/auth/webauthn/register/finish`   | `{handle, response, label?}`         | Validates the attestation, persists the credential. Auth-gated: requires a session unless no credentials are registered yet. |
 | POST | `/auth/webauthn/login/begin`       | `{}`                                 | Starts an authentication ceremony. Returns `{handle, options}`; forward to `navigator.credentials.get()`. |
@@ -71,25 +65,18 @@ All endpoints return JSON. Cookies are `bubble-session`,
 | `-rp-id HOST`            | unset  | WebAuthn Relying Party ID (the host without scheme/port — e.g. `bubble.local`). Empty disables the four `/auth/webauthn/*` endpoints. |
 | `-rp-name NAME`          | `BubbleUI` | WebAuthn display name shown in the browser's authenticator UI. |
 
-## Running against a real YubiKey
+## Running against a real security key
 
-```sh
-# Linux deps:
-#   Debian/Ubuntu:  apt install yubikey-personalization yubikey-manager
-#   Arch:           pacman -S yubikey-personalization yubikey-manager
+WebAuthn ceremonies run in the browser, not the daemon — point the SPA
+at the running `bubble-authd` (`-rp-id` matching the SPA's hostname) and
+register/log in from there. Any FIDO2 authenticator works: YubiKey 5+,
+SoloKey, Touch ID, Windows Hello, Android platform authenticator.
 
-go run ./cmd/bubble-authd provision
-# → prints recovery code + slot-2 secret in hex
-
-# Program the physical key with the printed secret:
-ykman otp chalresp --touch 2 <hex-secret>
-
-# Now log in:
-go run ./cmd/bubble-authd login
-```
-
-The daemon shells out to `ykchalresp` for the HMAC-SHA1 challenge.
-Touch the key when it blinks.
+The router-attached YubiKey HMAC-SHA1 challenge-response path that
+earlier builds shipped has been removed (upstream OpenWRT dropped
+`yubikey-personalization` from its package feed; see DESIGN.md §5
+and §11 for the future FIDO2 hmac-secret successor that will restore
+HW-bound at-rest wrap).
 
 ## Layout
 
@@ -101,13 +88,12 @@ backend/
 │   ├── bubble-netd/       net/firewall daemon (HTTP, /net surface)
 │   └── bubble-hwd/        hardware adapter daemon (HTTP, /hw surface)
 ├── internal/
-│   ├── auth/              Provision/Login/Recover (YubiKey + WebAuthn)
-│   ├── crypto/            self-wrap (HMAC→HKDF→AES-256-GCM), recovery codes
+│   ├── auth/              WebAuthn register/login/recover
+│   ├── crypto/            recovery-code primitives
 │   ├── store/             auth SQLite (credentials.db)
 │   ├── session/           HTTP session minting / validation / revocation
 │   ├── httpapi/           bubble-authd HTTP handlers
 │   ├── webauthn/          go-webauthn wrapper + pending-flow state
-│   ├── yubikey/           ykchalresp/ykman adapters + Mock
 │   ├── wgpool/            VPN config SQLite + .conf parser
 │   ├── prober/            parallel TCP-connect probe
 │   ├── selector/          rank candidates by probe RTT

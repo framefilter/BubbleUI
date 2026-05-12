@@ -1,3 +1,7 @@
+// Package crypto implements BubbleUI's recovery-code primitives per
+// DESIGN.md §5.4. Generation, BLAKE2s hashing for at-rest storage,
+// constant-time verification, and the human-readable formatting we
+// display once during the wizard.
 package crypto
 
 import (

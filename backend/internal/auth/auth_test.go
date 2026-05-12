@@ -9,144 +9,77 @@ import (
 
 	gowa "github.com/go-webauthn/webauthn/webauthn"
 
+	bcrypto "github.com/framefilter/bubbleui/backend/internal/crypto"
 	"github.com/framefilter/bubbleui/backend/internal/store"
 	"github.com/framefilter/bubbleui/backend/internal/webauthn"
-	"github.com/framefilter/bubbleui/backend/internal/yubikey"
 )
 
-func newTestAuth(t *testing.T) (*Authenticator, *yubikey.Mock) {
+func newTestAuth(t *testing.T) *Authenticator {
 	t.Helper()
 	s, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "creds.db"))
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
-	mock := yubikey.NewMock()
-	return New(s, mock), mock
+	return New(s)
 }
 
-func TestProvisionAndLogin(t *testing.T) {
-	a, yk := newTestAuth(t)
-	ctx := context.Background()
-
-	res, err := a.ProvisionYubiKey(ctx, "")
+// seedRecoveryCode plants a recovery code directly in the store, mirroring
+// what FinishRegisterWebAuthn does the first time a credential is added.
+// Used by the recovery-flow tests so they don't have to run a real WebAuthn
+// ceremony (which requires a hardware authenticator).
+func seedRecoveryCode(t *testing.T, a *Authenticator) string {
+	t.Helper()
+	code, err := bcrypto.NewRecoveryCode()
 	if err != nil {
-		t.Fatalf("ProvisionYubiKey: %v", err)
+		t.Fatalf("NewRecoveryCode: %v", err)
 	}
-	if res.CredentialID == 0 {
-		t.Fatal("expected nonzero CredentialID")
-	}
-	if res.RecoveryCode == "" {
-		t.Fatal("expected nonempty RecoveryCode")
-	}
-	if len(res.Secret) != SecretLen {
-		t.Fatalf("Secret len = %d, want %d", len(res.Secret), SecretLen)
-	}
-
-	// Simulate the user programming their physical key with the secret.
-	if err := yk.Program(context.Background(), yubikey.Slot2, res.Secret); err != nil {
-		t.Fatal(err)
-	}
-
-	id, err := a.LoginYubiKey(ctx)
+	hashed, err := bcrypto.HashRecoveryCode(code)
 	if err != nil {
-		t.Fatalf("LoginYubiKey: %v", err)
+		t.Fatalf("HashRecoveryCode: %v", err)
 	}
-	if id != res.CredentialID {
-		t.Fatalf("login matched id %d, want %d", id, res.CredentialID)
+	if err := a.Store.SetRecoveryCodeHash(context.Background(), hashed); err != nil {
+		t.Fatalf("SetRecoveryCodeHash: %v", err)
 	}
-}
-
-func TestLoginRejectsWrongKey(t *testing.T) {
-	a, yk := newTestAuth(t)
-	ctx := context.Background()
-
-	res, _ := a.ProvisionYubiKey(ctx, "")
-
-	// Programmed with wrong secret.
-	wrong := make([]byte, SecretLen)
-	for i := range wrong {
-		wrong[i] = 0xff
-	}
-	if err := yk.Program(context.Background(), yubikey.Slot2, wrong); err != nil {
-		t.Fatal(err)
-	}
-
-	if _, err := a.LoginYubiKey(ctx); !errors.Is(err, ErrChallengeFail) {
-		t.Fatalf("expected ErrChallengeFail, got %v", err)
-	}
-
-	// Programming with the right key now should succeed.
-	if err := yk.Program(context.Background(), yubikey.Slot2, res.Secret); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := a.LoginYubiKey(ctx); err != nil {
-		t.Fatalf("LoginYubiKey after correction: %v", err)
-	}
-}
-
-func TestLoginRequiresKeyPresent(t *testing.T) {
-	a, yk := newTestAuth(t)
-	ctx := context.Background()
-
-	res, _ := a.ProvisionYubiKey(ctx, "")
-	if err := yk.Program(context.Background(), yubikey.Slot2, res.Secret); err != nil {
-		t.Fatal(err)
-	}
-	yk.Unplug() // programmed but disconnected: must reject
-
-	if _, err := a.LoginYubiKey(ctx); !errors.Is(err, ErrChallengeFail) {
-		t.Fatalf("expected ErrChallengeFail, got %v", err)
-	}
-}
-
-func TestLoginRequiresProvisioning(t *testing.T) {
-	a, _ := newTestAuth(t)
-	if _, err := a.LoginYubiKey(context.Background()); !errors.Is(err, ErrNoCredential) {
-		t.Fatalf("expected ErrNoCredential, got %v", err)
-	}
+	return code
 }
 
 func TestRecoverHappyPath(t *testing.T) {
-	a, yk := newTestAuth(t)
+	a := newTestAuth(t)
 	ctx := context.Background()
 
-	res, _ := a.ProvisionYubiKey(ctx, "")
-	if err := yk.Program(context.Background(), yubikey.Slot2, res.Secret); err != nil {
+	code := seedRecoveryCode(t, a)
+	// Seed a credential row too so we can verify recovery wipes it.
+	if _, err := a.Store.AddCredential(ctx, store.Credential{
+		Kind:           store.KindWebAuthn,
+		Label:          "fake",
+		CredentialID:   []byte("demo"),
+		PublicMaterial: []byte("{}"),
+	}); err != nil {
 		t.Fatal(err)
 	}
-
-	// Confirm credential exists pre-recovery.
 	if has, _ := a.HasAnyCredential(ctx); !has {
 		t.Fatal("expected credential to exist pre-recovery")
 	}
 
-	if err := a.Recover(ctx, res.RecoveryCode); err != nil {
+	if err := a.Recover(ctx, code); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
 
-	// Credential should be wiped.
 	if has, _ := a.HasAnyCredential(ctx); has {
 		t.Fatal("expected no credentials post-recovery")
 	}
 
-	// Login should now fail with ErrNoCredential.
-	if _, err := a.LoginYubiKey(ctx); !errors.Is(err, ErrNoCredential) {
-		t.Fatalf("expected ErrNoCredential post-recovery, got %v", err)
-	}
-
 	// Recovery code is single-use.
-	if err := a.Recover(ctx, res.RecoveryCode); !errors.Is(err, ErrBadRecovery) {
+	if err := a.Recover(ctx, code); !errors.Is(err, ErrBadRecovery) {
 		t.Fatalf("expected ErrBadRecovery on reuse, got %v", err)
 	}
 }
 
 func TestRecoverRejectsWrongCode(t *testing.T) {
-	a, _ := newTestAuth(t)
+	a := newTestAuth(t)
 	ctx := context.Background()
-	if _, err := a.ProvisionYubiKey(ctx, ""); err != nil {
-		t.Fatal(err)
-	}
+	_ = seedRecoveryCode(t, a)
 
 	cases := []string{"", "BOGUS-CODE", "AAAAA-AAAAA-AAAAA-AAAAA-AAAAA"}
 	for _, c := range cases {
@@ -158,19 +91,19 @@ func TestRecoverRejectsWrongCode(t *testing.T) {
 }
 
 func TestRecoverWithoutSetup(t *testing.T) {
-	a, _ := newTestAuth(t)
+	a := newTestAuth(t)
 	if err := a.Recover(context.Background(), "WHATEVER"); !errors.Is(err, ErrNoRecoveryCode) {
 		t.Fatalf("expected ErrNoRecoveryCode, got %v", err)
 	}
 }
 
 func TestRecoveryCodeNormalization(t *testing.T) {
-	a, _ := newTestAuth(t)
+	a := newTestAuth(t)
 	ctx := context.Background()
-	res, _ := a.ProvisionYubiKey(ctx, "")
+	code := seedRecoveryCode(t, a)
 
 	// User types it back lowercase with extra whitespace — should still work.
-	munged := "  " + lowercase(res.RecoveryCode) + "  "
+	munged := "  " + lowercase(code) + "  "
 	if err := a.Recover(ctx, munged); err != nil {
 		t.Fatalf("Recover(%q) failed: %v", munged, err)
 	}
@@ -198,7 +131,7 @@ func lowercase(s string) string {
 
 func newTestAuthWithWebAuthn(t *testing.T) *Authenticator {
 	t.Helper()
-	a, _ := newTestAuth(t)
+	a := newTestAuth(t)
 	eng, err := webauthn.New(webauthn.Config{
 		RPID:          "bubble.local",
 		RPDisplayName: "BubbleUI test",
@@ -212,7 +145,7 @@ func newTestAuthWithWebAuthn(t *testing.T) *Authenticator {
 }
 
 func TestWebAuthnRequiresEngine(t *testing.T) {
-	a, _ := newTestAuth(t)
+	a := newTestAuth(t)
 	ctx := context.Background()
 	if _, _, err := a.BeginRegisterWebAuthn(ctx); !errors.Is(err, ErrNoWebAuthn) {
 		t.Errorf("BeginRegister: expected ErrNoWebAuthn, got %v", err)

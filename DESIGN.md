@@ -75,14 +75,15 @@ A simple, security-conscious web UI for OpenWRT travel routers.
        v             v
 +--------------+  +-----------------+
 |  rpcd / ubus |  |  bubble-authd   |
-|  (UCI, net,  |  |  (shell/Go)     |
-|   wireless,  |  |  - ykchalresp   |
-|   firewall)  |  |  - issues rpcd  |
+|  (UCI, net,  |  |  (Go)           |
+|   wireless,  |  |  - WebAuthn     |
+|   firewall)  |  |    verification |
+|              |  |  - issues rpcd  |
 |              |  |    sessions     |
 +------+-------+  +--------+--------+
        |                   |
        v                   v
-   UCI / netifd       USB (ykpers, libusb)
+   UCI / netifd       (no USB code path)
 ```
 
 **Why this shape**
@@ -98,44 +99,27 @@ A simple, security-conscious web UI for OpenWRT travel routers.
 
 - **Scope:** *all* UI and SSH access requires a hardware-backed credential. No anonymous status page, no password fallback, no remote root.
 - **No passwords anywhere.** Not for the web UI, not for SSH. Authentication is purely hardware-backed.
-- **Factors (any registered credential is sufficient — they're co-equal, not primary/secondary):**
-  - **YubiKey on router USB** (or compatible: Nitrokey Pro/3, OnlyKey), via HMAC-SHA1 challenge-response (`ykchalresp`). The key lives plugged in.
-  - **WebAuthn from a registered browser** (Touch ID, Windows Hello, plugged-in FIDO2 key, etc.). Multiple devices can be registered; each is its own credential.
-- **Recovery:** a single 128-bit recovery code shown once at provisioning, BLAKE2s-hashed on disk, single-use, regenerable from settings (the old code is invalidated).
+- **Factor: WebAuthn (FIDO2).** A registered browser-side authenticator — Touch ID, Windows Hello, an Android device, a plugged-in FIDO2 hardware key (YubiKey 5+, SoloKey, etc.). Multiple devices can be registered; each is its own credential, and any registered credential is sufficient.
+- **No router-attached hardware key.** Earlier drafts described a co-equal "YubiKey on router USB" path via HMAC-SHA1 challenge-response (`ykchalresp`). That path has been removed: the upstream `yubikey-personalization` / `ykpers` package was dropped from openwrt/packages on 2025-11-22, so 25.12.x has no supported way to ship `ykchalresp` on the device. The HMAC-SHA1 model is also a strict security downgrade vs. FIDO2 (symmetric shared-secret vs. asymmetric per-credential). The future restoration of HW-bound at-rest wrapping uses the FIDO2 `hmac-secret` extension on a registered WebAuthn credential — see §11.8.
+- **Recovery:** a single 128-bit recovery code shown once at first registration, BLAKE2s-hashed on disk, single-use, regenerable from settings (the old code is invalidated).
 - **No password recovery, no email reset, no support backdoor.** If the user loses every registered credential AND the recovery code, the only path is factory reset and re-provision. This is the right outcome for a travel router — the device holds little irreplaceable state.
-- **Note on PAM:** `pam_yubico` does support YubiKey HMAC challenge-response, but `uhttpd` doesn't authenticate through PAM. We replicate the model in `bubble-authd` rather than bolt PAM into the web stack.
 
 ### 5.2 Provisioning flow (first boot)
 
 1. Router boots into setup mode on `192.168.8.1`. Firewall blocks WAN until setup completes.
-2. Wizard requires the user to register **at least one** credential. Both factor types are co-equal:
-   - **YubiKey on router USB:** generate a 20-byte random secret `S`, write to slot 2 (HMAC-SHA1, variable input), store `S` self-wrapped (see §5.5).
-   - **WebAuthn from this browser:** standard `navigator.credentials.create()` with the user's choice of platform or cross-platform authenticator. Public key persisted to `/etc/bubble/credentials.db`.
-3. Wizard generates a 128-bit recovery code, displays it once, **requires the user to type it back** to confirm preservation.
+2. Wizard requires the user to register **at least one** WebAuthn credential:
+   - Standard `navigator.credentials.create()` with the user's choice of platform or cross-platform authenticator. Public key persisted to `/etc/bubble/credentials.db`.
+3. On the first credential registration, the server mints a 128-bit recovery code, returns it to the wizard once, and stores only its BLAKE2s hash. The wizard **requires the user to type it back** to confirm preservation.
 4. Setup mode exits; future access requires a registered credential.
 
 ### 5.3 Login flow
 
-Two paths depending on which credential the user invokes; both yield the same session token.
-
-#### YubiKey-on-router
-
 1. SPA requests a session.
-2. `bubble-authd` shows "Touch the YubiKey on your router."
-3. Daemon enumerates USB; if no compatible key present → error.
-4. Daemon issues a fixed application-tagged challenge to recover `K_wrap` from the key, decrypts the stored ciphertext to obtain `S` in RAM (see §5.5).
-5. Daemon generates random 64-byte challenge `C`, calls `ykchalresp -2 C`.
-6. Daemon recomputes `HMAC-SHA1(S, C)` locally and compares constant-time.
-7. On match, mint session token, set cookie `HttpOnly; Secure; SameSite=Strict`.
-
-#### WebAuthn-from-browser
-
-1. SPA requests a session.
-2. Daemon issues a WebAuthn challenge listing all registered credential IDs.
-3. Browser prompts user via FIDO2 device.
-4. User taps; browser signs assertion.
-5. Daemon verifies signature against stored credential public key, constant-time.
-6. On match, mint session, set cookie.
+2. `bubble-authd` issues a WebAuthn challenge listing all registered credential IDs (`POST /auth/webauthn/login/begin`).
+3. Browser prompts user via the FIDO2 device — Touch ID, Windows Hello, plugged-in security key, etc.
+4. User taps / authorizes; browser signs the assertion.
+5. Daemon verifies signature against the stored credential public key, constant-time (`POST /auth/webauthn/login/finish`).
+6. On match, mint session token, set cookie `HttpOnly; Secure; SameSite=Strict`.
 
 ### 5.4 Recovery flow
 
@@ -149,14 +133,11 @@ There is no other recovery path. Lose all credentials *and* the recovery code �
 
 ### 5.5 At-rest protection of router-side secrets
 
-The YubiKey slot 2 secret `S` is the most sensitive on-device credential — it's what authenticates the router to the user's key. With no password to derive a wrapping key from, we **self-wrap with the key**:
+With WebAuthn-only auth (§5.1), the credentials store holds only **public** material: each registered credential's COSE public key, credential ID, and label. Public keys are public by definition; there is no symmetric secret on the device to protect at rest, and so the wizard does not derive or persist any HW-bound wrap key.
 
-- At provisioning, after writing `S` to slot 2, the daemon computes `K_wrap = HMAC-SHA1(S, "bubble-at-rest-v1")` (a fixed application-tagged challenge), encrypts `S` with `K_wrap` (AES-256-GCM, random nonce), and stores ciphertext + nonce in `/etc/bubble/credentials.db`. `S` is then zeroed from RAM.
-- At login, the daemon sends the same fixed challenge to the plugged-in YubiKey, receives `K_wrap`, decrypts the stored ciphertext to recover `S`.
+This is a *narrower* posture than earlier drafts described — the older "self-wrap `S` with HMAC-SHA1(S, fixed-challenge)" pattern is gone with the router-attached YubiKey path. Any future secret that should be wrapped against a hardware token (e.g. cached WireGuard private keys, future session-rebind tokens) goes through the FIDO2 `hmac-secret` extension on a registered WebAuthn credential rather than a router-side HMAC oracle. See §11.8 for the open work item.
 
-Net effect: physical theft of the router *without* the YubiKey yields no usable `S`. The threat model is unchanged for the case where both are stolen — but that's not worse than before, and it's strictly better than storing `S` in plaintext.
-
-For WebAuthn-only setups there is no `S`. Only credential public keys are stored; those are public by definition.
+Recovery codes are stored as BLAKE2s hashes only; the plaintext is shown to the user exactly once and never persisted on the device (§5.4).
 
 ### 5.6 What this does *not* protect against
 
@@ -329,10 +310,7 @@ The wizard runs in setup mode (`192.168.8.1`, WAN blocked). It walks the user fr
 
 1. **Welcome.** "BubbleUI setup. About 3 minutes."
 2. **Time check.** Silent if the browser's clock and the router's persisted clock agree within 5 min (§6.6); otherwise prompts.
-3. **Register a security key** *(required, ≥1)*. Two co-equal options:
-   - YubiKey on router USB — one click programs slot 2 (§5.2).
-   - WebAuthn from this browser — Touch ID, Windows Hello, plugged-in FIDO2 key.
-   Additional credentials can be registered later from settings.
+3. **Register a security key** *(required, ≥1)*. WebAuthn from this browser — Touch ID, Windows Hello, an Android device, or a plugged-in FIDO2 hardware key (YubiKey 5+, SoloKey, etc.). The credential ceremony runs in the browser; the router stores only the resulting public key. Additional credentials can be registered later from settings.
 4. **Recovery code** *(required)*. Generated server-side, displayed once, **typed back to confirm preservation**. The "I've written it down" path is intentionally not just a click — the recovery code is the *only* fallback if all credentials are lost (§5.4).
 5. **WireGuard configs** *(optional)*. Drag-drop or paste any number of configs into the pool. Skippable; addable later from VPN settings. Background prober and "fastest" selection apply automatically once the pool has ≥1 entry.
 6. **Uplink** *(optional)*. "Connect this router to the internet now, or skip and set up at the hotel."
@@ -503,7 +481,7 @@ Body text uses the same monospace at 14 px / 1.55 line-height. Going monospace-o
 
 | Component | Language | Role |
 |---|---|---|
-| `bubble-authd` | shell + `ykchalresp` (v0); Go (v1) | YubiKey HMAC challenge, WebAuthn assertion verification, recovery-code burn, session minting |
+| `bubble-authd` | Go | WebAuthn registration / assertion verification, recovery-code burn, session minting |
 | `bubble-rpcd-acl` | JSON | ACL files declaring exactly which `ubus` paths the UI may call |
 | `bubble-uhttpd-conf` | uhttpd config | Serves SPA, terminates TLS, proxies `/ubus` and `/auth` |
 | `bubble-setup` | shell | First-boot wizard helper (§6.7), drives provisioning |
@@ -646,6 +624,8 @@ Picking among these is work that follows showing the UI to the community, not wo
    - **Self-host a probe URL** (`probe.bubbleui.dev` or similar). Privacy-clean from the user's side but means we operate infra and that infra's request log becomes privacy-sensitive to us-as-maintainers; also a single point of failure.
    - **Multi-probe quorum.** Hit 2-of-3 unrelated hosts (e.g. Mozilla + Quad9 + a self-hosted), succeed if any succeed, with cert pinning on each. Best privacy properties, more code.
    - **Decision for M3:** single-probe with cert pin to `https://detectportal.firefox.com/success.txt` as a deliberate placeholder. Mozilla has the least-bad privacy posture of the OS-probe operators, the success.txt response is trivially verifiable, and the pin foils mid-flight tampering. Revisit before v1.0 — quorum is the likely landing spot.
+
+8. **HW-bound at-rest wrap via FIDO2 `hmac-secret`** *(post-v1.0)*. Earlier drafts of §5.5 used the router-attached YubiKey's HMAC-SHA1 oracle to derive a wrap key for the slot-2 secret stored on disk: physical theft of the router without the key yielded nothing usable. That construction is gone with the router-attached path (§5.1). The intended replacement is the FIDO2 `hmac-secret` extension on a registered WebAuthn credential — the user's authenticator (Touch ID, YubiKey 5+, etc.) derives a per-credential symmetric key from a server-stored salt, the daemon uses that to wrap whatever symmetric secret needs at-rest protection (cached WG keys, future session-rebind tokens), and the wrapped blob can only be unwrapped while the user re-authenticates with that authenticator. Work items: (a) verify `github.com/go-webauthn/webauthn` supports the `hmac-secret` extension parameter on both register and assert (it does as of v0.10.x, but we haven't wired it); (b) add a per-credential salt column to the credentials store; (c) gate the wrap flow on a fresh assertion so the wrap key never persists in RAM beyond a single login window; (d) decide what actually gets wrapped — there is nothing in v1.0 that strictly needs HW-bound at-rest protection (WG private keys are the most defensible candidate), so this remains an enabling design, not a forcing one.
 
 ## 12. Milestones
 

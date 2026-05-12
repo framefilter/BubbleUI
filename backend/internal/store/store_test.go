@@ -9,6 +9,12 @@ import (
 	"testing"
 )
 
+// testKindOther is a dummy CredentialKind for store tests that need to
+// verify multi-kind filtering behavior. The schema accepts arbitrary
+// TEXT kinds — we don't ship anything but KindWebAuthn today, but the
+// store-layer filter contract should still be testable.
+const testKindOther CredentialKind = "test_other"
+
 func newStore(t *testing.T) *Store {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "creds.db")
@@ -36,12 +42,12 @@ func TestAddAndListCredentials(t *testing.T) {
 	ctx := context.Background()
 
 	id1, err := s.AddCredential(ctx, Credential{
-		Kind:        KindYubiKeyHMAC,
-		Label:       "router yubikey",
-		PrivateBlob: []byte("wrapped-secret-1"),
+		Kind:        testKindOther,
+		Label:       "legacy-kind row",
+		PrivateBlob: []byte("legacy-blob-1"),
 	})
 	if err != nil {
-		t.Fatalf("AddCredential yk: %v", err)
+		t.Fatalf("AddCredential (testKindOther): %v", err)
 	}
 	if id1 == 0 {
 		t.Fatal("expected nonzero id")
@@ -64,34 +70,35 @@ func TestAddAndListCredentials(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("got %d credentials, want 2", len(got))
 	}
-	if got[0].Kind != KindYubiKeyHMAC || got[1].Kind != KindWebAuthn {
+	if got[0].Kind != testKindOther || got[1].Kind != KindWebAuthn {
 		t.Fatalf("ordering wrong: %v / %v", got[0].Kind, got[1].Kind)
 	}
-	if !bytes.Equal(got[0].PrivateBlob, []byte("wrapped-secret-1")) {
-		t.Fatal("yk private blob roundtrip failed")
+	if !bytes.Equal(got[0].PrivateBlob, []byte("legacy-blob-1")) {
+		t.Fatal("private blob roundtrip failed")
 	}
 }
 
 func TestGetCredentialByKind(t *testing.T) {
 	s := newStore(t)
 	ctx := context.Background()
-	if _, err := s.GetCredentialByKind(ctx, KindYubiKeyHMAC); !errors.Is(err, sql.ErrNoRows) {
+	if _, err := s.GetCredentialByKind(ctx, KindWebAuthn); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("expected sql.ErrNoRows, got %v", err)
 	}
 	_, err := s.AddCredential(ctx, Credential{
-		Kind:        KindYubiKeyHMAC,
-		Label:       "yk",
-		PrivateBlob: []byte("blob"),
+		Kind:           KindWebAuthn,
+		Label:          "test",
+		CredentialID:   []byte("id"),
+		PublicMaterial: []byte("k"),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	c, err := s.GetCredentialByKind(ctx, KindYubiKeyHMAC)
+	c, err := s.GetCredentialByKind(ctx, KindWebAuthn)
 	if err != nil {
 		t.Fatalf("GetCredentialByKind: %v", err)
 	}
-	if string(c.PrivateBlob) != "blob" {
-		t.Fatal("blob mismatch")
+	if string(c.PublicMaterial) != "k" {
+		t.Fatal("material mismatch")
 	}
 }
 
@@ -101,7 +108,7 @@ func TestRequiresKindAndLabel(t *testing.T) {
 	if _, err := s.AddCredential(ctx, Credential{Label: "x"}); err == nil {
 		t.Fatal("expected error for missing kind")
 	}
-	if _, err := s.AddCredential(ctx, Credential{Kind: KindYubiKeyHMAC}); err == nil {
+	if _, err := s.AddCredential(ctx, Credential{Kind: KindWebAuthn}); err == nil {
 		t.Fatal("expected error for missing label")
 	}
 }
@@ -169,9 +176,10 @@ func TestDeleteAllCredentials(t *testing.T) {
 	ctx := context.Background()
 	for i := 0; i < 3; i++ {
 		_, err := s.AddCredential(ctx, Credential{
-			Kind:        KindYubiKeyHMAC,
-			Label:       "yk",
-			PrivateBlob: []byte{byte(i)},
+			Kind:           KindWebAuthn,
+			Label:          "wa",
+			CredentialID:   []byte{byte(i)},
+			PublicMaterial: []byte{byte(i)},
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -189,11 +197,11 @@ func TestDeleteAllCredentials(t *testing.T) {
 func TestMarkCredentialUsed(t *testing.T) {
 	s := newStore(t)
 	ctx := context.Background()
-	id, _ := s.AddCredential(ctx, Credential{Kind: KindYubiKeyHMAC, Label: "yk", PrivateBlob: []byte("x")})
+	id, _ := s.AddCredential(ctx, Credential{Kind: KindWebAuthn, Label: "wa", CredentialID: []byte("id"), PublicMaterial: []byte("k")})
 	if err := s.MarkCredentialUsed(ctx, id); err != nil {
 		t.Fatalf("MarkCredentialUsed: %v", err)
 	}
-	c, _ := s.GetCredentialByKind(ctx, KindYubiKeyHMAC)
+	c, _ := s.GetCredentialByKind(ctx, KindWebAuthn)
 	if c.LastUsedAt.IsZero() {
 		t.Fatal("LastUsedAt was not updated")
 	}
@@ -251,7 +259,7 @@ func TestEnsureUserIDStable(t *testing.T) {
 func TestListCredentialsByKind(t *testing.T) {
 	s := newStore(t)
 	ctx := context.Background()
-	_, _ = s.AddCredential(ctx, Credential{Kind: KindYubiKeyHMAC, Label: "yk-1", PrivateBlob: []byte("a")})
+	_, _ = s.AddCredential(ctx, Credential{Kind: testKindOther, Label: "other-1", PrivateBlob: []byte("a")})
 	_, _ = s.AddCredential(ctx, Credential{Kind: KindWebAuthn, Label: "wa-1", CredentialID: []byte("id1"), PublicMaterial: []byte("k1")})
 	_, _ = s.AddCredential(ctx, Credential{Kind: KindWebAuthn, Label: "wa-2", CredentialID: []byte("id2"), PublicMaterial: []byte("k2")})
 
@@ -266,9 +274,9 @@ func TestListCredentialsByKind(t *testing.T) {
 		t.Fatalf("ordering wrong: %v", []string{wa[0].Label, wa[1].Label})
 	}
 
-	yk, _ := s.ListCredentialsByKind(ctx, KindYubiKeyHMAC)
-	if len(yk) != 1 {
-		t.Fatalf("got %d yk rows, want 1", len(yk))
+	other, _ := s.ListCredentialsByKind(ctx, testKindOther)
+	if len(other) != 1 {
+		t.Fatalf("got %d testKindOther rows, want 1", len(other))
 	}
 }
 

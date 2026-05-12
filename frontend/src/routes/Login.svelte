@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { loginYubiKey, recover } from '../lib/session.svelte';
+  import { loginWebAuthn, recover } from '../lib/session.svelte';
   import { ICON } from '../lib/icons';
 
   let mode = $state<'login' | 'recover'>('login');
@@ -11,7 +11,7 @@
     e.preventDefault();
     error = '';
     busy = true;
-    const result = await loginYubiKey();
+    const result = await loginWebAuthn();
     busy = false;
     if (!result.ok) error = result.reason ?? 'login failed';
   }
@@ -40,14 +40,15 @@
     <form onsubmit={doLogin}>
       <h1><span class="icon">{ICON.router}</span> BubbleUI</h1>
       <p class="hint">
-        Touch the YubiKey on your router to sign in.
+        Use your security key — Touch ID, Windows Hello, or a FIDO2 key
+        plugged into this device.
       </p>
 
       <button type="submit" disabled={busy}>
         {#if busy}
           <span class="icon spin">{ICON.refresh}</span> waiting for key
         {:else}
-          <span class="icon">{ICON.key}</span> sign in with YubiKey
+          <span class="icon">{ICON.key}</span> sign in with security key
         {/if}
       </button>
 

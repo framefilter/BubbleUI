@@ -1,9 +1,9 @@
 <script lang="ts">
-  // First-boot wizard implementing DESIGN.md §6.7. Replaces the earlier
-  // SetupNeeded placeholder. The flow has four interactive steps:
+  // First-boot wizard implementing DESIGN.md §6.7. Four interactive
+  // steps:
   //
   //   1. Welcome
-  //   2. Register a security key — YubiKey-on-router or WebAuthn-from-browser
+  //   2. Register a WebAuthn security key
   //   3. Recovery code with type-back confirmation
   //   4. Done
   //
@@ -16,19 +16,14 @@
   import { refresh } from '../lib/session.svelte';
 
   type Step = 'welcome' | 'key' | 'recovery' | 'done';
-  type KeyChoice = 'yubikey' | 'webauthn' | null;
 
   let step = $state<Step>('welcome');
-  let choice = $state<KeyChoice>(null);
   let busy = $state(false);
   let error = $state('');
 
   // Set after the credential is registered. Recovery code is shown to
   // the user once and never persisted client-side.
   let recoveryCode = $state('');
-  // For the YubiKey-not-programmed fallback path:
-  let manualSecret = $state('');
-  let manualHint = $state('');
 
   // Type-back state: user must re-enter the recovery code to advance.
   let typeBack = $state('');
@@ -38,23 +33,6 @@
 
   function normalize(s: string): string {
     return s.replace(/[\s-]/g, '').toUpperCase();
-  }
-
-  async function provisionYubiKey() {
-    error = '';
-    busy = true;
-    const r = await api.yubikeyProvision();
-    busy = false;
-    if (!r.ok) {
-      error = r.error.error;
-      return;
-    }
-    recoveryCode = r.data.recovery_code;
-    if (r.data.not_programmed) {
-      manualSecret = r.data.secret_hex ?? '';
-      manualHint = r.data.program_hint ?? '';
-    }
-    step = 'recovery';
   }
 
   async function registerWebAuthn() {
@@ -157,45 +135,29 @@
 
     {#if step === 'welcome'}
       <p>
-        Welcome. This wizard will set up the credentials you'll use to
+        Welcome. This wizard will set up the credential you'll use to
         sign into BubbleUI. It takes about three minutes and you'll need
-        either a YubiKey to plug into the router or a device with a
-        FIDO2 authenticator (Touch ID, Windows Hello, etc.).
-      </p>
-      <p class="hint">
-        If you have a hardware key in front of you, plug it into the
-        router's USB port now. We'll detect it on the next step.
+        a device with a FIDO2 authenticator — Touch ID, Windows Hello,
+        an Android device, or a hardware security key (YubiKey 5+,
+        SoloKey, etc.) plugged into <em>this</em> device.
       </p>
       <button onclick={() => (step = 'key')}>
         Get started <span class="icon">{ICON.bolt}</span>
       </button>
     {:else if step === 'key'}
-      <p>Choose how you want to authenticate to this router.</p>
+      <p>Register a security key for this router.</p>
 
       <div class="choices">
-        <label class="choice" class:selected={choice === 'yubikey'}>
-          <input type="radio" bind:group={choice} value="yubikey" />
-          <div>
-            <strong><span class="icon">{ICON.key}</span> YubiKey on the router USB port</strong>
-            <p>
-              The key stays plugged into the router. Logging in is a
-              physical touch on the key. Slot 2 must be empty — we'll
-              program it.
-            </p>
-          </div>
-        </label>
-
-        <label class="choice" class:selected={choice === 'webauthn'}>
-          <input type="radio" bind:group={choice} value="webauthn" />
+        <div class="choice selected">
           <div>
             <strong><span class="icon">{ICON.shield}</span> WebAuthn from this browser</strong>
             <p>
-              Use Touch ID, Windows Hello, or a FIDO2 key plugged into
-              the device you're reading this on. You can register more
-              devices later.
+              Your browser will prompt you to use this device's
+              authenticator (Touch ID, Windows Hello, FIDO2 key, etc.).
+              You can register more devices later from settings.
             </p>
           </div>
-        </label>
+        </div>
       </div>
 
       {#if error}
@@ -204,28 +166,12 @@
 
       <div class="actions">
         <button onclick={() => (step = 'welcome')} class="secondary">Back</button>
-        {#if choice === 'yubikey'}
-          <button onclick={provisionYubiKey} disabled={busy}>
-            {busy ? 'programming…' : 'program & continue'}
-          </button>
-        {:else if choice === 'webauthn'}
-          <button onclick={registerWebAuthn} disabled={busy}>
-            {busy ? 'waiting for browser…' : 'register & continue'}
-          </button>
-        {:else}
-          <button disabled>Pick one to continue</button>
-        {/if}
+        <button onclick={registerWebAuthn} disabled={busy}>
+          {busy ? 'waiting for browser…' : 'register & continue'}
+        </button>
       </div>
     {:else if step === 'recovery'}
       <h2><span class="icon">{ICON.warn}</span> Save your recovery code</h2>
-
-      {#if manualSecret}
-        <div class="manual">
-          <p class="hint">{manualHint}</p>
-          <p>Run this on the router shell to program your key:</p>
-          <pre>ykman otp chalresp --touch 2 {manualSecret}</pre>
-        </div>
-      {/if}
 
       <p>
         This is the <strong>only</strong> way to recover access if you
@@ -344,13 +290,4 @@
   .actions { display: flex; gap: 8px; justify-content: flex-end; }
   button.secondary { background: transparent; }
   button:disabled { opacity: 0.5; cursor: not-allowed; }
-
-  .manual {
-    background: var(--bg);
-    border: 1px solid var(--accent-warn);
-    border-radius: var(--radius);
-    padding: 12px;
-    display: grid;
-    gap: 8px;
-  }
 </style>

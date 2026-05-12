@@ -51,16 +51,16 @@ define Package/bubbleui
            +wireguard-tools \
            +dnsmasq-full \
            +https-dns-proxy \
-           +yubikey-personalization \
            +ca-bundle \
            +px5g-mbedtls
 endef
 
 define Package/bubbleui/description
   Focused, security-conscious admin UI for travel routers running
-  vanilla OpenWRT. Hardware-key auth (YubiKey HMAC + WebAuthn),
-  WireGuard with a real kill switch, captive-portal sign-in window
-  with tightly-scoped firewall holes, encrypted DNS by default.
+  vanilla OpenWRT. Hardware-key auth via WebAuthn (FIDO2 — security
+  keys, platform authenticators), WireGuard with a real kill switch,
+  captive-portal sign-in window with tightly-scoped firewall holes,
+  encrypted DNS by default.
 
   Reference hardware is the GL.iNet GL-AXT1800; any vanilla-OpenWRT-
   compatible device meeting the resource floor in DESIGN.md §13.3

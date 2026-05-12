@@ -1,10 +1,9 @@
 // Package store persists BubbleUI's auth state in SQLite — the resolved
 // answer to DESIGN.md §11.1.
 //
-// The schema is intentionally narrow: one credential table that holds both
-// YubiKey-self-wrapped secrets and WebAuthn credential public keys, plus a
-// small recovery_code table holding the BLAKE2s hash of the (single) active
-// recovery code.
+// The schema is intentionally narrow: one credential table holding
+// WebAuthn credential public keys, plus a small recovery_code table
+// holding the BLAKE2s hash of the (single) active recovery code.
 package store
 
 import (
@@ -18,19 +17,17 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// CredentialKind discriminates the rows in the credentials table.
+// CredentialKind discriminates the rows in the credentials table. We
+// keep this as a kind column even though only one kind exists today —
+// it costs nothing in the schema and lets us add post-v1.0 kinds (e.g.
+// passkey variants, recovery-only factors) without a migration.
 type CredentialKind string
 
 const (
-	KindYubiKeyHMAC CredentialKind = "yk_hmac"
-	KindWebAuthn    CredentialKind = "webauthn"
+	KindWebAuthn CredentialKind = "webauthn"
 )
 
 // Credential is a registered authentication factor.
-//
-// For KindYubiKeyHMAC: PublicMaterial is empty, PrivateBlob is the
-// AES-256-GCM ciphertext of the slot-2 secret S, self-wrapped under the key
-// derived from S itself (see internal/crypto).
 //
 // For KindWebAuthn: PublicMaterial is the credential's COSE-encoded public
 // key, PrivateBlob is empty.
@@ -152,8 +149,7 @@ func (s *Store) ListCredentials(ctx context.Context) ([]Credential, error) {
 }
 
 // GetCredentialByKind returns the first credential of the given kind, or
-// sql.ErrNoRows if none exists. Useful when there is exactly one
-// expected (e.g. one YubiKey-on-router HMAC credential).
+// sql.ErrNoRows if none exists.
 func (s *Store) GetCredentialByKind(ctx context.Context, kind CredentialKind) (Credential, error) {
 	row := s.db.QueryRowContext(ctx,
 		`SELECT id, kind, label, credential_id, public_material, private_blob, created_at, last_used_at

@@ -1,7 +1,7 @@
 // Package session manages BubbleUI's HTTP sessions. Sessions are
 // SQLite-backed so they survive a reboot — users on a freshly power-cycled
-// travel router don't have to re-tap their YubiKey unless their session
-// has actually expired.
+// travel router don't have to re-run the WebAuthn ceremony unless their
+// session has actually expired.
 //
 // Tokens are 32 bytes of crypto/rand entropy, base64url-encoded for the
 // cookie. The DB stores a BLAKE2s-256 hash of each token — DB compromise

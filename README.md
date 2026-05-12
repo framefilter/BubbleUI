@@ -78,8 +78,7 @@ opkg install /tmp/bubbleui_*.ipk
 ```
 
 The package pulls `nginx-ssl`, `nftables`, `wireguard-tools`,
-`dnsmasq-full`, `https-dns-proxy`, `yubikey-personalization`,
-`px5g-mbedtls`, and `ca-bundle`. First-boot wiring (self-signed UI
+`dnsmasq-full`, `https-dns-proxy`, `px5g-mbedtls`, and `ca-bundle`. First-boot wiring (self-signed UI
 cert, LAN firewall rule for 80/443, procd-supervised daemons) runs
 automatically via `/etc/uci-defaults/bubbleui`.
 

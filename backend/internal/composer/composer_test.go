@@ -34,11 +34,6 @@ func (r *recorderSetter) last() led.State {
 
 func newComposer(t *testing.T, vpnBody, signinBody string) (*Composer, *recorderSetter) {
 	t.Helper()
-	return newComposerWithHealth(t, vpnBody, signinBody, "")
-}
-
-func newComposerWithHealth(t *testing.T, vpnBody, signinBody, healthBody string) (*Composer, *recorderSetter) {
-	t.Helper()
 	vpn := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(vpnBody))
@@ -55,14 +50,6 @@ func newComposerWithHealth(t *testing.T, vpnBody, signinBody, healthBody string)
 	src := Source{
 		VPNStatusURL: vpn.URL + "/vpn/status",
 		NetSigninURL: signin.URL + "/net/signin/status",
-	}
-	if healthBody != "" {
-		health := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(healthBody))
-		}))
-		t.Cleanup(health.Close)
-		src.AuthHealthURL = health.URL + "/auth/health"
 	}
 
 	r := &recorderSetter{}
@@ -159,64 +146,6 @@ func TestRunPushesInitialStateThenTicks(t *testing.T) {
 	cancel()
 	// Give the loop a moment to exit.
 	time.Sleep(100 * time.Millisecond)
-}
-
-func TestComposeNoKeyWhenCredentialRegisteredButYubiKeyAbsent(t *testing.T) {
-	c, _ := newComposerWithHealth(t,
-		`{"active_id":7}`, // would be Secured without the NoKey override
-		`{"state":"closed"}`,
-		`{"has_credentials":true,"yubikey_present":false}`,
-	)
-	if got := c.Tick(context.Background()); got != led.StateNoKey {
-		t.Errorf("got %s, want no_key", got)
-	}
-}
-
-func TestComposeNoKeyIgnoredWhenCredentialNotRegistered(t *testing.T) {
-	c, _ := newComposerWithHealth(t,
-		`{"active_id":1}`,
-		`{"state":"closed"}`,
-		`{"has_credentials":false,"yubikey_present":false}`,
-	)
-	// No credential → NoKey is meaningless; fall through to Secured.
-	if got := c.Tick(context.Background()); got != led.StateSecured {
-		t.Errorf("got %s, want secured", got)
-	}
-}
-
-func TestComposeNoKeyIgnoredWhenYubiKeyPresent(t *testing.T) {
-	c, _ := newComposerWithHealth(t,
-		`{"active_id":1}`,
-		`{"state":"closed"}`,
-		`{"has_credentials":true,"yubikey_present":true}`,
-	)
-	if got := c.Tick(context.Background()); got != led.StateSecured {
-		t.Errorf("got %s, want secured", got)
-	}
-}
-
-func TestComposeNoKeyOverridesKillswitch(t *testing.T) {
-	c, _ := newComposerWithHealth(t,
-		`{"active_id":0}`, // tunnel down
-		`{"state":"closed"}`,
-		`{"has_credentials":true,"yubikey_present":false}`,
-	)
-	// User attention is more useful on "your key is missing" than
-	// "your kill switch is doing its job."
-	if got := c.Tick(context.Background()); got != led.StateNoKey {
-		t.Errorf("got %s, want no_key", got)
-	}
-}
-
-func TestComposeAuthHealthURLEmptySkipsRule(t *testing.T) {
-	// Same as TestComposeKillswitchWhenTunnelDown, no health URL.
-	c, _ := newComposer(t,
-		`{"active_id":0}`,
-		`{"state":"closed"}`,
-	)
-	if got := c.Tick(context.Background()); got != led.StateKillswitch {
-		t.Errorf("got %s, want killswitch_up (NoKey rule skipped)", got)
-	}
 }
 
 func TestLastReturnsLatest(t *testing.T) {

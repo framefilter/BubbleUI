@@ -1,35 +1,24 @@
 // Package auth implements the BubbleUI authentication flows from
-// DESIGN.md §5 — provisioning a YubiKey credential, logging in via HMAC
-// challenge-response, registering and authenticating WebAuthn credentials,
-// and the recovery-code path.
+// DESIGN.md §5 — registering and authenticating WebAuthn credentials,
+// and the recovery-code path. Hardware-key auth runs through WebAuthn
+// only; the formerly co-equal router-attached YubiKey HMAC path has
+// been removed (see §11 / project memory for the FIDO2 hmac-secret
+// follow-up that will eventually re-introduce HW-bound at-rest wrap).
 package auth
 
 import (
 	"context"
-	"crypto/hmac"
-	"crypto/rand"
-	"crypto/sha1"
-	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"hash"
 
 	gowa "github.com/go-webauthn/webauthn/webauthn"
 
 	bcrypto "github.com/framefilter/bubbleui/backend/internal/crypto"
 	"github.com/framefilter/bubbleui/backend/internal/store"
 	"github.com/framefilter/bubbleui/backend/internal/webauthn"
-	"github.com/framefilter/bubbleui/backend/internal/yubikey"
 )
-
-// SecretLen is the byte length of the YubiKey HMAC-SHA1 slot 2 secret S.
-// HMAC-SHA1 accepts any key length; 20 bytes is the canonical YubiKey choice.
-const SecretLen = 20
-
-// LoginChallengeLen is the byte length of the per-login random challenge.
-const LoginChallengeLen = 64
 
 // Errors returned by the auth flows. Callers should treat any of these as
 // "rejected" — never differentiate them in user-facing copy.
@@ -41,183 +30,17 @@ var (
 	ErrNoWebAuthn     = errors.New("auth: webauthn engine not configured")
 )
 
-// Authenticator wires the persistence + crypto + yubikey + webauthn
-// adapters together. One instance per running daemon.
+// Authenticator wires the persistence + webauthn adapters together. One
+// instance per running daemon.
 type Authenticator struct {
-	Store      *store.Store
-	Yubi       yubikey.Oracle
-	Programmer yubikey.Programmer     // optional; required for ProvisionYubiKeyAndProgram
-	WebAuthn   *webauthn.Engine       // optional; nil disables WebAuthn flows
-	NewKey     func() ([]byte, error) // override in tests; defaults to crypto/rand
+	Store    *store.Store
+	WebAuthn *webauthn.Engine // optional; nil disables WebAuthn flows
 }
 
-// New returns an Authenticator with crypto/rand-backed key generation
-// and no WebAuthn engine. Set Authenticator.WebAuthn after construction
-// to enable the WebAuthn flows.
-func New(s *store.Store, y yubikey.Oracle) *Authenticator {
-	return &Authenticator{
-		Store: s,
-		Yubi:  y,
-		NewKey: func() ([]byte, error) {
-			b := make([]byte, SecretLen)
-			_, err := rand.Read(b)
-			return b, err
-		},
-	}
-}
-
-// ProvisionResult bundles the values returned by the provisioning flow.
-// Callers MUST display RecoveryCode to the user exactly once and persist
-// nothing — only the BLAKE2s hash lives on disk. Secret is returned so the
-// caller can program slot 2 of the user's physical YubiKey via `ykman`.
-type ProvisionResult struct {
-	CredentialID int64
-	RecoveryCode string
-	Secret       []byte
-}
-
-// ProvisionYubiKey runs the §5.2 YubiKey-on-router provisioning flow.
-//
-// The caller is responsible for actually writing Secret to slot 2 of the
-// user's physical YubiKey before the user attempts to log in. The store
-// row is committed before that happens — if the user abandons the flow,
-// the on-disk state references a key that doesn't exist yet, but no harm
-// is done: login will simply fail until the key is programmed.
-func (a *Authenticator) ProvisionYubiKey(ctx context.Context, label string) (*ProvisionResult, error) {
-	if label == "" {
-		label = "router yubikey"
-	}
-	S, err := a.NewKey()
-	if err != nil {
-		return nil, fmt.Errorf("auth: generate secret: %w", err)
-	}
-
-	// Compute the wrap key the same way the YubiKey will once programmed:
-	// HMAC-SHA1(S, SelfWrapChallenge) → HKDF-SHA256 → 32 bytes.
-	wrapResp := hmacSHA1(S, bcrypto.SelfWrapChallenge())
-	wrapKey, err := bcrypto.DeriveWrapKey(wrapResp)
-	if err != nil {
-		return nil, err
-	}
-	blob, err := bcrypto.Wrap(wrapKey, S)
-	if err != nil {
-		return nil, err
-	}
-
-	id, err := a.Store.AddCredential(ctx, store.Credential{
-		Kind:        store.KindYubiKeyHMAC,
-		Label:       label,
-		PrivateBlob: blob,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("auth: persist credential: %w", err)
-	}
-
-	code, err := bcrypto.NewRecoveryCode()
-	if err != nil {
-		return nil, fmt.Errorf("auth: generate recovery: %w", err)
-	}
-	hashed, err := bcrypto.HashRecoveryCode(code)
-	if err != nil {
-		return nil, err
-	}
-	if err := a.Store.SetRecoveryCodeHash(ctx, hashed); err != nil {
-		return nil, fmt.Errorf("auth: persist recovery: %w", err)
-	}
-
-	return &ProvisionResult{CredentialID: id, RecoveryCode: code, Secret: S}, nil
-}
-
-// ProvisionYubiKeyAndProgram runs the full wizard provisioning step: it
-// generates the secret, persists the wrapped credential and recovery
-// code, then programs the secret into slot 2 of the attached YubiKey via
-// the configured Programmer. The recovery code is the only return value
-// the caller should ever display — Secret stays on the device.
-//
-// Programmer-failure semantics:
-//   - if Programmer is nil → returns the persisted result with NotProgrammed=true
-//     so the wizard can fall back to a copy-pasteable ykman command.
-//   - if Programmer returns ErrUnsupported (no ykman on PATH) → same as above.
-//   - if Programmer returns any other error → the credential row is rolled
-//     back so the user can retry without colliding state.
-type ProvisionAndProgramResult struct {
-	*ProvisionResult
-	NotProgrammed bool   // true if the Programmer wasn't run / couldn't run
-	ProgramHint   string // guidance to surface to the user when NotProgrammed
-}
-
-func (a *Authenticator) ProvisionYubiKeyAndProgram(ctx context.Context, label string) (*ProvisionAndProgramResult, error) {
-	res, err := a.ProvisionYubiKey(ctx, label)
-	if err != nil {
-		return nil, err
-	}
-	out := &ProvisionAndProgramResult{ProvisionResult: res}
-
-	if a.Programmer == nil {
-		out.NotProgrammed = true
-		out.ProgramHint = "no programmer configured; run ykman manually with the secret printed by the CLI"
-		return out, nil
-	}
-	if err := a.Programmer.Program(ctx, yubikey.Slot2, res.Secret); err != nil {
-		if errors.Is(err, yubikey.ErrUnsupported) {
-			out.NotProgrammed = true
-			out.ProgramHint = "ykman not available; copy the printed command and run it on the router shell"
-			return out, nil
-		}
-		// Real programming failure: roll back so the user can retry.
-		_ = a.Store.DeleteAllCredentials(ctx)
-		_ = a.Store.BurnRecoveryCode(ctx)
-		return nil, fmt.Errorf("auth: program key: %w", err)
-	}
-	return out, nil
-}
-
-// LoginYubiKey runs the §5.3 YubiKey-on-router login flow. Returns the
-// matched credential ID on success.
-func (a *Authenticator) LoginYubiKey(ctx context.Context) (int64, error) {
-	cred, err := a.Store.GetCredentialByKind(ctx, store.KindYubiKeyHMAC)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return 0, ErrNoCredential
-		}
-		return 0, err
-	}
-
-	// Recover the wrap key from the key via the fixed self-wrap challenge,
-	// then unwrap the stored S.
-	wrapResp, err := a.Yubi.Challenge(ctx, yubikey.Slot2, bcrypto.SelfWrapChallenge())
-	if err != nil {
-		return 0, ErrChallengeFail
-	}
-	wrapKey, err := bcrypto.DeriveWrapKey(wrapResp)
-	if err != nil {
-		return 0, err
-	}
-	S, err := bcrypto.Unwrap(wrapKey, cred.PrivateBlob)
-	if err != nil {
-		// Unwrap failure means the key changed or the blob is corrupt.
-		return 0, ErrChallengeFail
-	}
-	defer zero(S)
-
-	// Real login challenge: random bytes → key → compare HMAC.
-	challenge := make([]byte, LoginChallengeLen)
-	if _, err := rand.Read(challenge); err != nil {
-		return 0, fmt.Errorf("auth: rand: %w", err)
-	}
-	keyResp, err := a.Yubi.Challenge(ctx, yubikey.Slot2, challenge)
-	if err != nil {
-		return 0, ErrChallengeFail
-	}
-	expected := hmacSHA1(S, challenge)
-	if subtle.ConstantTimeCompare(keyResp, expected) != 1 {
-		return 0, ErrChallengeFail
-	}
-
-	if err := a.Store.MarkCredentialUsed(ctx, cred.ID); err != nil {
-		return 0, err
-	}
-	return cred.ID, nil
+// New returns an Authenticator with no WebAuthn engine. Set
+// Authenticator.WebAuthn after construction to enable the WebAuthn flows.
+func New(s *store.Store) *Authenticator {
+	return &Authenticator{Store: s}
 }
 
 // Recover runs the §5.4 recovery flow. On success, all credentials are
@@ -438,14 +261,3 @@ func (a *Authenticator) FinishLoginWebAuthn(ctx context.Context, handle string, 
 	return row.ID, nil
 }
 
-func hmacSHA1(key, msg []byte) []byte {
-	var h hash.Hash = hmac.New(sha1.New, key)
-	h.Write(msg)
-	return h.Sum(nil)
-}
-
-func zero(b []byte) {
-	for i := range b {
-		b[i] = 0
-	}
-}

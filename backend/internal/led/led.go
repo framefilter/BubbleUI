@@ -38,7 +38,6 @@ const (
 	StateSecured          // solid green
 	StateKillswitch       // slow red blink — kill switch active, no internet
 	StateSigninOpen       // double-pulse heartbeat — §6.5 sign-in window open
-	StateNoKey            // fast blink — YubiKey expected but missing
 	StateFault            // very fast blink — hardware fault
 )
 
@@ -56,8 +55,6 @@ func (s State) String() string {
 		return "killswitch_up"
 	case StateSigninOpen:
 		return "signin_open"
-	case StateNoKey:
-		return "no_key"
 	case StateFault:
 		return "fault"
 	default:
@@ -81,8 +78,6 @@ func ParseState(s string) (State, error) {
 		return StateKillswitch, nil
 	case "signin_open":
 		return StateSigninOpen, nil
-	case "no_key":
-		return StateNoKey, nil
 	case "fault":
 		return StateFault, nil
 	default:
@@ -309,8 +304,6 @@ func patternFor(s State) pattern {
 		// Linux gpio-keys 'timer' trigger only supports a single on/off
 		// cycle; we approximate with a 4 Hz blink that's visually distinct.
 		return pattern{trigger: "timer", brightness: 220, rgb: rgbFor(220, 200, 0), delayOnMs: 250, delayOffMs: 250}
-	case StateNoKey:
-		return pattern{trigger: "timer", brightness: 220, rgb: rgbFor(220, 0, 0), delayOnMs: 200, delayOffMs: 200}
 	case StateFault:
 		return pattern{trigger: "timer", brightness: 220, rgb: rgbFor(220, 0, 0), delayOnMs: 100, delayOffMs: 100}
 	}

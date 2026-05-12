@@ -1,7 +1,6 @@
-// bubble-authd is BubbleUI's authentication daemon. The CLI provides
-// direct access to the auth flows (provision, login, recover, status)
-// for development and the `serve` subcommand exposes the same flows
-// over HTTP for the SPA.
+// bubble-authd is BubbleUI's authentication daemon. CLI verbs cover
+// the administrative paths that don't need a browser; `serve` exposes
+// the WebAuthn ceremony + session endpoints over HTTP for the SPA.
 //
 // The ubus integration on top of this is M3 territory; for now the
 // daemon listens on plain HTTP behind uhttpd's TLS termination, or on
@@ -10,7 +9,6 @@ package main
 
 import (
 	"context"
-	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -28,18 +26,13 @@ import (
 	"github.com/framefilter/bubbleui/backend/internal/session"
 	"github.com/framefilter/bubbleui/backend/internal/store"
 	"github.com/framefilter/bubbleui/backend/internal/webauthn"
-	"github.com/framefilter/bubbleui/backend/internal/yubikey"
 )
 
 const usage = `bubble-authd — BubbleUI auth daemon
 
-usage: bubble-authd [-db PATH] [-mock] <command> [args]
+usage: bubble-authd [-db PATH] <command> [args]
 
 Commands:
-  provision           Generate a new YubiKey HMAC credential and recovery code.
-                      Prints the recovery code (display once) and the slot-2
-                      secret in hex (program with: ykman otp chalresp 2 <hex>).
-  login               Run the login flow against the attached YubiKey.
   recover <code>      Burn the recovery code and wipe credentials.
   status              Show registered credentials.
   serve [-listen ADDR] [-allowed-origin URL] [-insecure] [-rp-id HOST]
@@ -52,11 +45,10 @@ Commands:
 Flags:
   -db   PATH   credentials.db path (default: $XDG_STATE_HOME/bubbleui/credentials.db
                or ~/.local/state/bubbleui/credentials.db)
-  -mock        Use the in-memory mock YubiKey. The CLI prompts for the slot-2
-               secret in hex on every challenge — useful for end-to-end testing
-               without hardware. Never use this on a real router.
 
-A real YubiKey requires the ykchalresp tool (yubikey-personalization package).
+Hardware-key auth runs through WebAuthn (FIDO2) only. Register and log in
+from a browser pointed at the SPA; there is no router-side hardware-key
+flow in this build.
 `
 
 func main() {
@@ -69,11 +61,9 @@ func main() {
 func run() error {
 	var (
 		dbPath   string
-		useMock  bool
 		showHelp bool
 	)
 	flag.StringVar(&dbPath, "db", "", "credentials.db path")
-	flag.BoolVar(&useMock, "mock", false, "use in-memory mock YubiKey")
 	flag.BoolVar(&showHelp, "help", false, "show help")
 	flag.Usage = func() { fmt.Fprint(os.Stderr, usage) }
 	flag.Parse()
@@ -103,27 +93,11 @@ func run() error {
 	}
 	defer s.Close()
 
-	yk := buildOracle(useMock)
-	a := auth.New(s, yk)
-
-	// The Programmer is what writes slot 2 during the wizard's YubiKey
-	// provision flow. In mock mode the same Mock instance services both
-	// roles. With real hardware, ykman handles it.
-	if useMock {
-		if m, ok := yk.(*yubikey.Mock); ok {
-			a.Programmer = m
-		}
-	} else {
-		a.Programmer = yubikey.NewYkmanProgrammer()
-	}
+	a := auth.New(s)
 
 	cmd := flag.Arg(0)
 	args := flag.Args()[1:]
 	switch cmd {
-	case "provision":
-		return cmdProvision(ctx, a, dbPath, useMock)
-	case "login":
-		return cmdLogin(ctx, a, dbPath, useMock, yk)
 	case "recover":
 		if len(args) == 0 {
 			return errors.New("recover requires the recovery code as argument")
@@ -132,74 +106,10 @@ func run() error {
 	case "status":
 		return cmdStatus(ctx, s)
 	case "serve":
-		return cmdServe(ctx, a, s, useMock, dbPath, args, yk)
+		return cmdServe(ctx, a, s, args)
 	default:
 		return fmt.Errorf("unknown command %q (try -h)", cmd)
 	}
-}
-
-func cmdProvision(ctx context.Context, a *auth.Authenticator, dbPath string, useMock bool) error {
-	res, err := a.ProvisionYubiKey(ctx, "")
-	if err != nil {
-		return fmt.Errorf("provision: %w", err)
-	}
-	fmt.Println("Provisioning complete.")
-	fmt.Println()
-	fmt.Println("Recovery code (write this down — shown ONCE):")
-	fmt.Println("    " + res.RecoveryCode)
-	fmt.Println()
-	fmt.Println("Slot-2 secret (program your YubiKey with this):")
-	fmt.Println("    " + hex.EncodeToString(res.Secret))
-	fmt.Println()
-	fmt.Println("On real hardware:")
-	fmt.Println("    ykman otp chalresp --touch 2 " + hex.EncodeToString(res.Secret))
-
-	if useMock {
-		// Persist the mock secret to a sidecar file so subsequent CLI
-		// invocations can re-create the same virtual key state.
-		sidecar := dbPath + ".mock-secret"
-		if err := os.WriteFile(sidecar, []byte(hex.EncodeToString(res.Secret)), 0o600); err != nil {
-			return fmt.Errorf("write mock sidecar: %w", err)
-		}
-		fmt.Println()
-		fmt.Println("(mock secret saved to " + sidecar + " for subsequent -mock login)")
-	}
-	return nil
-}
-
-func cmdLogin(ctx context.Context, a *auth.Authenticator, dbPath string, useMock bool, yk yubikey.Oracle) error {
-	if useMock {
-		secret, err := loadMockSecret(dbPath)
-		if err != nil {
-			return fmt.Errorf("mock secret: %w", err)
-		}
-		m, ok := yk.(*yubikey.Mock)
-		if !ok {
-			return errors.New("internal: -mock did not yield a Mock oracle")
-		}
-		if err := m.Program(ctx, yubikey.Slot2, secret); err != nil {
-			return fmt.Errorf("mock program: %w", err)
-		}
-	}
-
-	id, err := a.LoginYubiKey(ctx)
-	if err != nil {
-		return fmt.Errorf("login: %w", err)
-	}
-	fmt.Printf("OK: authenticated as credential id=%d\n", id)
-	return nil
-}
-
-func loadMockSecret(dbPath string) ([]byte, error) {
-	if envHex := os.Getenv("BUBBLE_MOCK_SECRET_HEX"); envHex != "" {
-		return hex.DecodeString(envHex)
-	}
-	sidecar := dbPath + ".mock-secret"
-	data, err := os.ReadFile(sidecar)
-	if err != nil {
-		return nil, fmt.Errorf("read %s: %w (provision first, or set BUBBLE_MOCK_SECRET_HEX)", sidecar, err)
-	}
-	return hex.DecodeString(strings.TrimSpace(string(data)))
 }
 
 func cmdRecover(ctx context.Context, a *auth.Authenticator, code string) error {
@@ -231,14 +141,7 @@ func cmdStatus(ctx context.Context, s *store.Store) error {
 	return nil
 }
 
-func buildOracle(useMock bool) yubikey.Oracle {
-	if useMock {
-		return yubikey.NewMock()
-	}
-	return yubikey.NewCLI()
-}
-
-func cmdServe(ctx context.Context, a *auth.Authenticator, s *store.Store, useMock bool, dbPath string, args []string, yk yubikey.Oracle) error {
+func cmdServe(ctx context.Context, a *auth.Authenticator, s *store.Store, args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	listen := fs.String("listen", "127.0.0.1:8765", "address to listen on")
 	tlsCert := fs.String("tls-cert", "", "path to TLS cert (omit for plain HTTP behind uhttpd)")
@@ -250,16 +153,6 @@ func cmdServe(ctx context.Context, a *auth.Authenticator, s *store.Store, useMoc
 	rpName := fs.String("rp-name", "BubbleUI", "WebAuthn relying party display name")
 	if err := fs.Parse(args); err != nil {
 		return err
-	}
-
-	// In mock mode, prime the in-memory YubiKey from the persisted
-	// sidecar so login works against an already-provisioned store.
-	if useMock {
-		if m, ok := yk.(*yubikey.Mock); ok {
-			if secret, err := loadMockSecret(dbPath); err == nil {
-				_ = m.Program(ctx, yubikey.Slot2, secret)
-			}
-		}
 	}
 
 	mgr, err := session.NewManager(ctx, s.DB())
@@ -333,7 +226,7 @@ func cmdServe(ctx context.Context, a *auth.Authenticator, s *store.Store, useMoc
 		}
 	}()
 
-	logger.Info("bubble-authd listening", "addr", *listen, "tls", *tlsCert != "", "mock_yubikey", useMock)
+	logger.Info("bubble-authd listening", "addr", *listen, "tls", *tlsCert != "")
 	if *tlsCert != "" && *tlsKey != "" {
 		err = srv.ListenAndServeTLS(*tlsCert, *tlsKey)
 	} else {
