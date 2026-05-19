@@ -9,44 +9,78 @@
 #   3. Reload nginx + firewall so the changes take effect.
 #
 # We don't write /etc/config/bubbleui here — it's shipped as a
-# conffile, so opkg installs it directly with the package's defaults.
+# conffile, so the package installer drops it directly with the
+# package's defaults.
 
 set -e
 
-# 1. Self-signed cert with broad validity (DESIGN §6.6). px5g is
-# OpenWRT's tiny TLS toolchain. We use ECDSA P-256 rather than RSA:
-# px5g-mbedtls in OpenWRT 25.12.x silently ignores `-bits` for RSA
-# and tries a 512-bit modulus that mbedtls 3.x refuses outright, so
-# `selfsigned -type rsa -bits 2048` exits non-zero with "key
-# generation failed" on a stock 25.12 install. P-256 is well-formed
-# in px5g, mbedtls accepts it, and every modern browser handles it.
-# RSA fallback could be revisited once px5g-mbedtls is fixed
-# upstream; the openssl fallback covers builds where px5g isn't
-# available (x86, mostly).
+# Everything we do here also goes to logread under tag `bubbleui` so
+# `logread -e bubble` after first boot surfaces any failure instead
+# of leaving us guessing why the UI wouldn't come up. (Earlier
+# revisions of this script silently no-op'd if cert generation
+# failed; that cost us a debugging cycle on real hardware.)
+log() { logger -t bubbleui -p daemon.info "$*"; }
+err() { logger -t bubbleui -p daemon.err  "$*"; }
+
+log "uci-defaults start"
+
+# 1. Self-signed cert with broad validity (DESIGN §6.6). openssl is
+# our preferred tool because it's well-documented, stable across
+# OpenWRT releases, and already on disk via libopenssl that nginx-ssl
+# pulls in. px5g-mbedtls used to be the primary path but it silently
+# no-ops on 25.x — even after switching the key type from RSA to
+# ECDSA P-256 (a1626b6), cert generation still didn't complete on
+# real hardware. openssl-util is now an explicit DEPENDS so the CLI
+# must be present.
 mkdir -p /etc/bubble
 chmod 0700 /etc/bubble
 
 if [ ! -f /etc/bubble/ui.pem ] || [ ! -f /etc/bubble/ui.key ]; then
 	HOSTNAME=$(uci -q get bubbleui.ui.hostname || echo bubble.local)
+	log "generating self-signed UI cert for CN=${HOSTNAME}"
 
-	if command -v px5g >/dev/null 2>&1; then
-		px5g selfsigned -type ec -curve prime256v1 \
-			-keyout /etc/bubble/ui.key \
-			-out    /etc/bubble/ui.pem \
-			-days   28000 \
-			-subj   "/CN=${HOSTNAME}"
-	elif command -v openssl >/dev/null 2>&1; then
-		openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
-			-keyout /etc/bubble/ui.key \
-			-out    /etc/bubble/ui.pem \
-			-days   28000 \
-			-subj   "/CN=${HOSTNAME}"
-	else
-		echo "bubbleui: no TLS toolchain (px5g or openssl) found; UI cert not generated" >&2
+	if ! command -v openssl >/dev/null 2>&1; then
+		err "openssl CLI missing — cannot generate UI cert. Install openssl-util."
 		exit 1
 	fi
+
+	# -addext subjectAltName=... is required: modern browsers
+	# ignore the CN field and only accept the cert if the hostname
+	# matches a SAN entry. Users hitting the router by IP will still
+	# see the cert warning; we'll wire dynamic IP SANs in a later
+	# revision once the dust settles.
+	#
+	# Capture openssl output to a temp file (busybox ash has no
+	# pipefail, so piping straight to logger would mask a failed
+	# openssl behind logger's success). On success we drop the log —
+	# it's just ~2 KB of PRNG progress dots. On failure we replay it
+	# through logger so the error is on the record.
+	openssl_log=$(mktemp)
+	if openssl req -x509 -newkey rsa:2048 -nodes \
+		-keyout /etc/bubble/ui.key \
+		-out    /etc/bubble/ui.pem \
+		-days   28000 \
+		-subj   "/CN=${HOSTNAME}" \
+		-addext "subjectAltName=DNS:${HOSTNAME},DNS:bubble.local" \
+		>"$openssl_log" 2>&1; then
+		rm -f "$openssl_log"
+	else
+		rc=$?
+		err "openssl cert generation failed (exit ${rc}) — UI will not load"
+		# Replay openssl's output through logger so the failure mode
+		# is on the record. -f reads from file; fall back to a raw
+		# err line if -f isn't supported on this busybox build.
+		logger -t bubbleui -p daemon.err -f "$openssl_log" 2>/dev/null || \
+			err "openssl stderr (raw): $(cat "$openssl_log" 2>/dev/null)"
+		rm -f "$openssl_log"
+		exit 1
+	fi
+
 	chmod 0600 /etc/bubble/ui.key
 	chmod 0644 /etc/bubble/ui.pem
+	log "UI cert written to /etc/bubble/ui.pem"
+else
+	log "UI cert already present; leaving in place"
 fi
 
 # 2. LAN firewall: allow inbound 80/443 from the LAN zone so the

@@ -52,7 +52,14 @@ define Package/bubbleui
            +dnsmasq-full \
            +https-dns-proxy \
            +ca-bundle \
-           +px5g-mbedtls
+           +openssl-util
+  # We use the openssl CLI to generate the first-boot self-signed UI
+  # cert (see files/etc/uci-defaults/bubbleui). px5g-mbedtls used to
+  # be our preferred path because it's tiny, but it silently no-ops on
+  # OpenWRT 25.x in ways we couldn't reproduce locally. openssl is
+  # ~250 KB heavier compressed but is a known-good, well-documented
+  # tool, and libopenssl is already on disk via nginx-ssl so the
+  # incremental cost is just the CLI.
 endef
 
 define Package/bubbleui/description
