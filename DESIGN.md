@@ -17,7 +17,7 @@ A simple, security-conscious web UI for OpenWRT travel routers.
 
 ## 2. Non-goals (v0)
 
-- A full LuCI replacement. We expose a focused subset; LuCI stays installed for power users.
+- A full LuCI replacement. We expose a focused subset. LuCI is **not shipped** (see §5.1): it is a password-based admin surface that would bypass our WebAuthn-only auth. A power user can `apk add luci` on demand, as a deliberate opt-in they understand weakens the device's security posture — a user choice, not a default and not a recovery mechanism.
 - Mesh, multi-AP, enterprise auth, IPv6 prefix delegation tuning, advanced QoS.
 - GL.iNet stock firmware compatibility. Targeting **vanilla OpenWRT 23.05+** first; GL.iNet coexistence is a follow-up.
 - A mobile app. The UI is a responsive PWA.
@@ -103,6 +103,7 @@ A simple, security-conscious web UI for OpenWRT travel routers.
 - **No router-attached hardware key.** Earlier drafts described a co-equal "YubiKey on router USB" path via HMAC-SHA1 challenge-response (`ykchalresp`). That path has been removed: the upstream `yubikey-personalization` / `ykpers` package was dropped from openwrt/packages on 2025-11-22, so 25.12.x has no supported way to ship `ykchalresp` on the device. The HMAC-SHA1 model is also a strict security downgrade vs. FIDO2 (symmetric shared-secret vs. asymmetric per-credential). The future restoration of HW-bound at-rest wrapping uses the FIDO2 `hmac-secret` extension on a registered WebAuthn credential — see §11.8.
 - **Recovery:** a single 128-bit recovery code shown once at first registration, BLAKE2s-hashed on disk, single-use, regenerable from settings (the old code is invalidated).
 - **No password recovery, no email reset, no support backdoor.** If the user loses every registered credential AND the recovery code, the only path is factory reset and re-provision. This is the right outcome for a travel router — the device holds little irreplaceable state.
+- **No LuCI by default.** LuCI's rpcd/password login is a parallel auth surface that would defeat the WebAuthn-only rule above, so it is not shipped. A power user may `apk add luci` on demand to get full LuCI — an explicit, out-of-band opt-in that knowingly weakens this posture. It is a user choice, not a backdoor we ship, and not a recovery path (it requires a working uplink). See §2 and §14.5.
 
 ### 5.2 Provisioning flow (first boot)
 
@@ -872,6 +873,6 @@ PRs to extend the quirks registry are how new devices opt into Tier 2
 
 - **Don't write our own hardware drivers** when OpenWRT already drives the hardware. We're an application, not a BSP.
 - **Don't fork per-device variants** of any binary. One `.ipk` per architecture, hardware diversity at config-time.
-- **Don't hide the UCI/ubus surface** from users who want to fall back to LuCI for niche tweaks. We're a focused web UI, not a replacement OS.
+- **Don't hide the UCI/ubus surface** from users who want more than we expose. We're a focused web UI, not a replacement OS. For niche tweaks a power user can install LuCI on demand (`apk add luci`) — an explicit, security-weakening opt-in (§2, §5.1), not something we ship by default.
 
 
